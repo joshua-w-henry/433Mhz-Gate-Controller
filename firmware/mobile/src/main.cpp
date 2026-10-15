@@ -8,6 +8,8 @@
 #include "config.h"
 #include "button.h"
 #include "radio_probe.h"
+#include <RadioLib.h>
+#include "../../shared/radio_pins.h"
 
 // Mobile bench commissioning only. No RF packets or physical gate activation.
 Adafruit_SSD1306 oled(128,64,&Wire,-1);
@@ -17,6 +19,24 @@ uint8_t oledAddr=0;
 uint32_t sessionID=0, sequence=0, lastInteraction=0, lastDraw=0, messageAt=0;
 int page=0;
 String banner="";
+CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
+bool linkOK=false;
+uint32_t benchPingSeq=0;
+void sendBenchPing() {
+  if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
+  String ping="BENCHPING:"+String(++benchPingSeq);
+  int sent=packetRadio.transmit(ping);
+  Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
+  if(sent==RADIOLIB_ERR_NONE) {
+    String reply;
+    int rx=packetRadio.receive(reply,1200);
+    if(rx==RADIOLIB_ERR_NONE) Serial.printf("RF_REPLY payload=%s rssi=%.1f\n",reply.c_str(),packetRadio.getRSSI());
+    else Serial.printf("RF_REPLY_TIMEOUT code=%d\n",rx);
+  }
+  wakeScreen();
+  banner="RF PING TEST"; messageAt=millis();
+}
+
 
 void wakeScreen() {
   lastInteraction=millis();
@@ -72,6 +92,10 @@ void setup() {
   Serial.printf("\nRF Gate Mobile BENCH v0.1 name=%s\n",REMOTE_NAME);
   Serial.printf("OLED %s address=0x%02X\n",displayOK?"OK":"NOT FOUND",oledAddr);
   probeRadio();
+  int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
+  linkOK=(rc==RADIOLIB_ERR_NONE);
+  Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
+  Serial.println("p=send harmless RF BENCHPING; no actuation commands transmitted");
   Serial.println("a=ACTIVATE test; s=STATUS test/page; r=radio probe; h=help");
   Serial.println("Requests are logged locally only. No RF transmissions. Gate remains UNKNOWN.");
   lastInteraction=millis();
@@ -85,7 +109,8 @@ void loop() {
   else if(a) requestBench("ACTIVATE");
   while(Serial.available()) {
     char c=Serial.read();
-    if(c=='a') requestBench("ACTIVATE");
+    if(c=='p') sendBenchPing();
+    else if(c=='a') requestBench("ACTIVATE");
     else if(c=='s') { page=(page+1)%2; requestBench("STATUS"); }
     else if(c=='r') { wakeScreen(); probeRadio(); }
     else if(c=='h') Serial.println("a=ACT test; s=STATUS test/page; r=radio probe. BENCH ONLY: no packets.");
