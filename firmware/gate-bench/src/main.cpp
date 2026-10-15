@@ -195,6 +195,7 @@ void tickBenchLink() {
       String reply="BENCHACK:"+packet.substring(10);
       uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
       radioPacketPending=false; // RX GDO0 can also toggle during a TX transition
+      delay(120); // Bench turnaround: allow mobile to finish TX and arm RX.
       int tx=packetRadio.transmit(reply);
       logGdo2Monitor("gate_ack",edgeBefore,highBefore);
       radioPacketPending=false;
