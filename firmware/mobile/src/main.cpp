@@ -53,13 +53,12 @@ void sendBenchPing() {
   String ping="BENCHPING:"+String(++benchPingSeq);
   uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
   int sent=packetRadio.transmit(ping);
-  logGdo2Monitor("mobile_ping",edgeBefore,highBefore);
-  Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
-  if(sent!=RADIOLIB_ERR_NONE) mobileRfDiagnostics("mobile_ping_tx_error");
   if(sent==RADIOLIB_ERR_NONE) {
     mobileRxPending=false;
     packetRadio.setPacketReceivedAction(onMobileRadioPacket);
     int rxStart=packetRadio.startReceive();
+    logGdo2Monitor("mobile_ping",edgeBefore,highBefore);
+    Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
     Serial.printf("RF_RX_ARM code=%d GDO0=%d\n",rxStart,digitalRead(RF_GDO0_PIN));
     bool gotReply=false;
     uint32_t waitStart=millis();
@@ -81,7 +80,7 @@ void sendBenchPing() {
     packetRadio.standby();
     packetRadio.clearPacketReceivedAction();
     if(!gotReply) { Serial.println("RF_REPLY_TIMEOUT"); mobileRfDiagnostics("mobile_reply_rx_error"); }
-  }
+  } else { logGdo2Monitor("mobile_ping",edgeBefore,highBefore); Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent); mobileRfDiagnostics("mobile_ping_tx_error"); }
   wakeScreen();
   banner="RF PING TEST"; messageAt=millis();
 }
