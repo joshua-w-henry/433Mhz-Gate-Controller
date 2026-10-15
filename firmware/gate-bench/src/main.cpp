@@ -171,6 +171,17 @@ bool validBenchPing(const String &s) {
   for(unsigned i=10;i<s.length();++i) if(s[i]<'0'||s[i]>'9') return false;
   return true;
 }
+void printRfConfig() {
+  const uint8_t addrs[]={0x00,0x02,0x06,0x07,0x08,0x0B,0x0C,0x0D,0x0E,0x0F,0x10,0x11,0x12,0x13,0x15,0x18,0x19,0x1B,0x21,0x22};
+  const char* names[]={"IOCFG2","IOCFG0","PKTLEN","PKTCTRL1","PKTCTRL0","FSCTRL1","FSCTRL0","FREQ2","FREQ1","FREQ0","MDMCFG4","MDMCFG3","MDMCFG2","MDMCFG1","DEVIATN","MCSM0","FOCCFG","AGCCTRL2","FREND1","FREND0"};
+  Serial.println("RF_CONFIG_BEGIN");
+  for(unsigned i=0;i<sizeof(addrs);++i) {
+    uint8_t v=0;
+    bool ok=regRead(addrs[i],v);
+    Serial.printf("RF_REG %s=0x%02X ok=%d\n",names[i],v,ok);
+  }
+  Serial.println("RF_CONFIG_END");
+}
 void startBenchLink() {
   // SPI-only probe remains independent. No actuation commands are ever processed.
   int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
@@ -414,6 +425,7 @@ void printStatus() {
 }
 void command(char c) {
   if(c=='d') { benchRxStatus("manual"); return; }
+  if(c=='D') { printRfConfig(); return; }
   if(c=='R') { radioPacketPending=false; packetRadio.standby(); int rc=packetRadio.startReceive(); Serial.printf("RF_RX_RESET code=%d\n",rc); benchRxStatus("reset"); return; }
   if(c=='A') {
     if(!faultActive()) { message("No fault to acknowledge"); return; }
