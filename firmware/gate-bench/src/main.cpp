@@ -15,6 +15,12 @@ bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
 int page=0, closedRaw=-1, openRaw=-1;
 float filtered=0, position=0;
+constexpr float ANGLE_TOLERANCE_DEG=5.0f;
+constexpr float OPEN_ENTER_PCT=100.0f*(1.0f-ANGLE_TOLERANCE_DEG/TRAVEL_DEG);
+constexpr float OPEN_EXIT_PCT=100.0f*(1.0f-2.0f*ANGLE_TOLERANCE_DEG/TRAVEL_DEG);
+constexpr uint32_t SETTLE_MS=1500, AGREEMENT_GRACE_MS=2000;
+bool openAngle=false, settled=false, mismatchPending=false, sensorFault=false;
+uint32_t settledSince=0, mismatchSince=0;
 int motion=0; // -1 closing, 0 stationary, +1 opening
 // Movement decisions use a timed displacement window, rather than adjacent ADC readings.
 constexpr float MOTION_THRESHOLD_PCT=0.8f;
@@ -116,6 +122,9 @@ void resetMotion() {
   motionWindowAt=millis();
   lastMove=millis();
   motionInitialized=false;
+  settled=false; settledSince=0;
+  mismatchPending=false; mismatchSince=0;
+  sensorFault=false; openAngle=false;
 }
 
 void tickMotion(uint32_t now) {
@@ -154,20 +163,42 @@ void tickMotion(uint32_t now) {
 }
 
 void tickSensors(uint32_t now) {
-  closedSwitch.tick(now);
+  bool closedEdge=closedSwitch.tick(now);
   if(now-lastSample<20) return;
   lastSample=now;
   int raw=analogRead(POT_PIN);
   filtered=samples==0?raw:filtered+0.18f*(raw-filtered); ++samples;
   if(calibrated()) {
-    // Preserve the unrestricted reading for disagreement/fault detection.
     position=100.0f*(filtered-closedRaw)/(openRaw-closedRaw);
     tickMotion(now);
-    if(position < -8 || position >108 || (closedSwitch.stable && fabsf(position)>5)) state="SENSOR DISAGREE";
-    else if(closedSwitch.stable) state="CLOSED";
+    float angle=position*TRAVEL_DEG/100.0f;
+    if(openAngle) {
+      if(position<OPEN_EXIT_PCT) openAngle=false;
+    } else if(position>=OPEN_ENTER_PCT) openAngle=true;
+
+    // Settled agreement: 5-degree spatial tolerance plus temporal grace.
+    if(closedEdge || motion!=0) {
+      settled=false; settledSince=0;
+      mismatchPending=false; mismatchSince=0; sensorFault=false;
+    }
+    if(motion==0 && settledSince==0) settledSince=now;
+    settled=motion==0 && now-settledSince>=SETTLE_MS;
+    bool nearClosed=fabsf(angle)<=ANGLE_TOLERANCE_DEG;
+    bool invalidRange=angle < -ANGLE_TOLERANCE_DEG ||
+                      angle > TRAVEL_DEG+ANGLE_TOLERANCE_DEG;
+    bool disagrees=invalidRange || (closedSwitch.stable && !nearClosed);
+    if(settled && disagrees) {
+      if(!mismatchPending) { mismatchPending=true; mismatchSince=now; }
+      if(now-mismatchSince>=AGREEMENT_GRACE_MS) sensorFault=true;
+    } else {
+      mismatchPending=false; mismatchSince=0; sensorFault=false;
+    }
+
+    if(sensorFault) state="SENSOR DISAGREE";
+    else if(closedSwitch.stable && !disagrees) state="CLOSED";
     else if(motion>0) state="OPENING";
     else if(motion<0) state="CLOSING";
-    else if(fabsf(position-100)<=2) state="OPEN (ANGLE)";
+    else if(settled && openAngle) state="OPEN (ANGLE)";
     else state="STOPPED BETWEEN";
   } else {
     if(motionInitialized) resetMotion();
@@ -179,9 +210,9 @@ void tickSensors(uint32_t now) {
   }
 }
 void printStatus() {
-  Serial.printf("raw=%.1f closedSwitch=%d calClosed=%d calOpen=%d calibrated=%d position=%.1f%% state=%s radio=%s requests=%lu\n",
+  Serial.printf("raw=%.1f closedSwitch=%d calClosed=%d calOpen=%d calibrated=%d position=%.1f%% state=%s radio=%s requests=%lu settled=%d mismatchPending=%d fault=%d\n",
     filtered,closedSwitch.stable,closedRaw,openRaw,calibrated(),calibrated()?constrain(position,0.0f,100.0f):0,
-    state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount);
+    state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount,settled,mismatchPending,sensorFault);
 }
 void command(char c) {
   if(c=='c' || c=='o') {
