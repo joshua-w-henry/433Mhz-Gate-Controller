@@ -23,16 +23,23 @@ CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
 bool linkOK=false;
 uint32_t benchPingSeq=0;
 void wakeScreen();
+void mobileRfDiagnostics(const char *site) {
+  uint8_t marc=0,txBytes=0,rxBytes=0;
+  bool ok=regRead(0x35,marc,true) && regRead(0x3A,txBytes,true) && regRead(0x3B,rxBytes,true);
+  Serial.printf("RF_DIAG site=%s spi=%d GDO0=%d GDO2=%d MARCSTATE=0x%02X TXBYTES=0x%02X RXBYTES=0x%02X\n",
+    site,ok,digitalRead(RF_GDO0_PIN),digitalRead(RF_GDO2_PIN),marc,txBytes,rxBytes);
+}
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
   String ping="BENCHPING:"+String(++benchPingSeq);
   int sent=packetRadio.transmit(ping);
   Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
+  if(sent!=RADIOLIB_ERR_NONE) mobileRfDiagnostics("mobile_ping_tx_error");
   if(sent==RADIOLIB_ERR_NONE) {
     String reply;
     int rx=packetRadio.receive(reply,1200);
     if(rx==RADIOLIB_ERR_NONE) Serial.printf("RF_REPLY payload=%s rssi=%.1f\n",reply.c_str(),packetRadio.getRSSI());
-    else Serial.printf("RF_REPLY_TIMEOUT code=%d\n",rx);
+    else { Serial.printf("RF_REPLY_TIMEOUT code=%d\n",rx); mobileRfDiagnostics("mobile_reply_rx_error"); }
   }
   wakeScreen();
   banner="RF PING TEST"; messageAt=millis();
