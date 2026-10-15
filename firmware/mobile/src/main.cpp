@@ -20,6 +20,23 @@ uint32_t sessionID=0, sequence=0, lastInteraction=0, lastDraw=0, messageAt=0;
 int page=0;
 String banner="";
 CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
+volatile uint32_t gdo2Edges=0, gdo2HighEdges=0;
+void IRAM_ATTR gdo2EdgeMonitor() {
+  ++gdo2Edges;
+  if(digitalRead(RF_GDO2_PIN)) ++gdo2HighEdges;
+}
+void beginGdo2Monitor() {
+  pinMode(RF_GDO2_PIN,INPUT);
+  attachInterrupt(digitalPinToInterrupt(RF_GDO2_PIN),gdo2EdgeMonitor,CHANGE);
+}
+void logGdo2Monitor(const char *site, uint32_t beforeEdges, uint32_t beforeHigh) {
+  noInterrupts();
+  uint32_t edges=gdo2Edges, high=gdo2HighEdges;
+  interrupts();
+  Serial.printf("RF_GDO2_TRACE site=%s edges=%lu rising=%lu level=%d\n",
+    site,(unsigned long)(edges-beforeEdges),(unsigned long)(high-beforeHigh),digitalRead(RF_GDO2_PIN));
+}
+
 bool linkOK=false;
 uint32_t benchPingSeq=0;
 void wakeScreen();
@@ -32,7 +49,9 @@ void mobileRfDiagnostics(const char *site) {
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
   String ping="BENCHPING:"+String(++benchPingSeq);
+  uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
   int sent=packetRadio.transmit(ping);
+  logGdo2Monitor("mobile_ping",edgeBefore,highBefore);
   Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
   if(sent!=RADIOLIB_ERR_NONE) mobileRfDiagnostics("mobile_ping_tx_error");
   if(sent==RADIOLIB_ERR_NONE) {
@@ -102,6 +121,7 @@ void setup() {
   probeRadio();
   int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
   linkOK=(rc==RADIOLIB_ERR_NONE);
+  beginGdo2Monitor();
   Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
   Serial.println("p=send harmless RF BENCHPING; no actuation commands transmitted");
   Serial.println("a=ACTIVATE test; s=STATUS test/page; r=radio probe; h=help");
