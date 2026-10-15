@@ -32,6 +32,24 @@ bool motionInitialized=false;
 uint32_t lastSample=0, lastDraw=0, lastReport=0, samples=0;
 String state="STARTING", notice="";
 uint32_t noticeAt=0, activationCount=0;
+
+struct Debounced {
+  explicit Debounced(int p) : pin(p) {}
+  int pin; bool raw=false, stable=false; uint32_t changed=0;
+  void begin() { pinMode(pin,INPUT_PULLUP); raw=stable=(digitalRead(pin)==LOW); changed=millis(); }
+  bool tick(uint32_t now) {
+    bool v=digitalRead(pin)==LOW;
+    if(v!=raw) { raw=v; changed=now; }
+    if(stable!=raw && now-changed>=35) { stable=raw; return true; }
+    return false;
+  }
+};
+Debounced closedSwitch{CLOSED_PIN}, service{BUTTON_PIN};
+bool buttonReady=false, armed=false, longShown=false;
+uint8_t taps=0;
+uint32_t downAt=0, armedAt=0;
+
+bool calibrated() { return closedRaw>=0 && openRaw>=0 && abs(openRaw-closedRaw)>=400; }
 // Operational fault is latched for the session until explicitly cleared.
 // Keep raw sensor health separate and never clear an active sensor problem.
 String operationFault="NONE";
@@ -53,23 +71,6 @@ void latchOperationFault(const char *name, uint32_t now) {
 }
 
 
-struct Debounced {
-  explicit Debounced(int p) : pin(p) {}
-  int pin; bool raw=false, stable=false; uint32_t changed=0;
-  void begin() { pinMode(pin,INPUT_PULLUP); raw=stable=(digitalRead(pin)==LOW); changed=millis(); }
-  bool tick(uint32_t now) {
-    bool v=digitalRead(pin)==LOW;
-    if(v!=raw) { raw=v; changed=now; }
-    if(stable!=raw && now-changed>=35) { stable=raw; return true; }
-    return false;
-  }
-};
-Debounced closedSwitch{CLOSED_PIN}, service{BUTTON_PIN};
-bool buttonReady=false, armed=false, longShown=false;
-uint8_t taps=0;
-uint32_t downAt=0, armedAt=0;
-
-bool calibrated() { return closedRaw>=0 && openRaw>=0 && abs(openRaw-closedRaw)>=400; }
 void message(const String &s) { notice=s; noticeAt=millis(); Serial.println(s); }
 void activateBench() {
   ++activationCount;
