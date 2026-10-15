@@ -142,6 +142,17 @@ void probeRadio() {
   Serial.printf("CC1101 SPI %s PART=0x%02X VERSION=0x%02X (RF idle)\n",radioOK?"PASS":"FAIL",radioPart,radioVersion);
 }
 
+void printRfDiagnostics(const char *site) {
+  uint8_t marc=0, txBytes=0, rxBytes=0;
+  bool ok=regRead(0x35,marc,true) && regRead(0x3A,txBytes,true) && regRead(0x3B,rxBytes,true);
+  Serial.printf("RF_DIAG site=%s spi=%d GDO0=%d GDO2=%d MARCSTATE=0x%02X TXBYTES=0x%02X RXBYTES=0x%02X\n",
+    site,ok,digitalRead(RF_GDO0_PIN),digitalRead(RF_GDO2_PIN),marc,txBytes,rxBytes);
+}
+bool validBenchPing(const String &s) {
+  if(!s.startsWith("BENCHPING:") || s.length()<11 || s.length()>20) return false;
+  for(unsigned i=10;i<s.length();++i) if(s[i]<'0'||s[i]>'9') return false;
+  return true;
+}
 void startBenchLink() {
   // SPI-only probe remains independent. No actuation commands are ever processed.
   int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
@@ -162,14 +173,16 @@ void tickBenchLink() {
     Serial.printf("RF_RX payload=%s rssi=%.1f count=%lu\n",
       packet.c_str(),packetRadio.getRSSI(),(unsigned long)rfRx);
     // BENCHPING is deliberately not an actuation request and has no authority.
-    if(packet.startsWith("BENCHPING:") && packet.length()<=32) {
+    if(validBenchPing(packet)) {
       String reply="BENCHACK:"+packet.substring(10);
       int tx=packetRadio.transmit(reply);
       if(tx==RADIOLIB_ERR_NONE) ++rfAck;
       Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
-    }
+      if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
+    } else Serial.println("RF_RX_IGNORED malformed bench packet");
   } else Serial.printf("RF_RX_ERROR code=%d\n",rc);
-  packetRadio.startReceive();
+  int rr=packetRadio.startReceive();
+  if(rr!=RADIOLIB_ERR_NONE) Serial.printf("RF_REARM_ERROR code=%d\n",rr);
 }
 
 void resetMotion() {
