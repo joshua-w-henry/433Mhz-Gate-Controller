@@ -210,7 +210,7 @@ void tickSensors(uint32_t now) {
   }
 }
 // Observation-only movement expectation supervisor. No relay or RF actuation.
-constexpr uint32_t START_TIMEOUT_MS=4000, STALL_TIMEOUT_MS=3000, TRAVEL_TIMEOUT_MS=45000;
+constexpr uint32_t START_TIMEOUT_MS=5000, STALL_TIMEOUT_MS=5000, TRAVEL_TIMEOUT_MS=45000;
 // Require at least ~5 degrees of confirmed travel before classifying a stall.
 constexpr float START_DELTA_PCT=100.0f*ANGLE_TOLERANCE_DEG/TRAVEL_DEG;
 constexpr float REVERSE_DELTA_PCT=START_DELTA_PCT, PROGRESS_DELTA_PCT=0.8f;
