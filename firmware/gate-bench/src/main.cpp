@@ -5,12 +5,19 @@
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <RadioLib.h>
+#include "../../shared/radio_pins.h"
 
 // BENCH ONLY: no relay drive, no wireless commands, no Wi-Fi credentials.
 constexpr int CS=27, MISO_PIN=19, CLOSED_PIN=32, BUTTON_PIN=13, POT_PIN=34;
 constexpr float TRAVEL_DEG=90.0f; // Display scale only; change for actual hinge travel.
 Adafruit_SSD1306 oled(128,64,&Wire,-1);
 Preferences prefs;
+CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
+volatile bool radioPacketPending=false;
+void onRadioPacket() { radioPacketPending=true; }
+bool linkOK=false;
+uint32_t rfRx=0, rfAck=0;
 bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
 int page=0, closedRaw=-1, openRaw=-1;
@@ -133,6 +140,36 @@ void probeRadio() {
   }
   radioOK=ok && radioPart==0 && radioVersion!=0 && radioVersion!=255;
   Serial.printf("CC1101 SPI %s PART=0x%02X VERSION=0x%02X (RF idle)\n",radioOK?"PASS":"FAIL",radioPart,radioVersion);
+}
+
+void startBenchLink() {
+  // SPI-only probe remains independent. No actuation commands are ever processed.
+  int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(rc==RADIOLIB_ERR_NONE) {
+    packetRadio.setPacketReceivedAction(onRadioPacket);
+    rc=packetRadio.startReceive();
+  }
+  linkOK=(rc==RADIOLIB_ERR_NONE);
+  Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
+}
+void tickBenchLink() {
+  if(!linkOK || !radioPacketPending) return;
+  radioPacketPending=false;
+  String packet;
+  int rc=packetRadio.readData(packet);
+  if(rc==RADIOLIB_ERR_NONE) {
+    ++rfRx;
+    Serial.printf("RF_RX payload=%s rssi=%.1f count=%lu\n",
+      packet.c_str(),packetRadio.getRSSI(),(unsigned long)rfRx);
+    // BENCHPING is deliberately not an actuation request and has no authority.
+    if(packet.startsWith("BENCHPING:") && packet.length()<=32) {
+      String reply="BENCHACK:"+packet.substring(10);
+      int tx=packetRadio.transmit(reply);
+      if(tx==RADIOLIB_ERR_NONE) ++rfAck;
+      Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
+    }
+  } else Serial.printf("RF_RX_ERROR code=%d\n",rc);
+  packetRadio.startReceive();
 }
 
 void resetMotion() {
@@ -414,10 +451,10 @@ void setup() {
   prefs.begin("gate-angle",false); closedRaw=prefs.getInt("closed",-1); openRaw=prefs.getInt("open",-1);
   Serial.println("\nMM571 GateNode Bench v1 - NO RELAY OUTPUT / NO RF COMMANDS");
   Serial.printf("OLED %s address=0x%02X\n",displayOK?"OK":"NOT FOUND",oledAddr);
-  probeRadio(); command('h');
+  probeRadio(); startBenchLink(); command('h');
 }
 void loop() {
-  uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now);
+  uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now); tickBenchLink();
   while(Serial.available()) command(Serial.read());
   if(now-lastReport>=2000) { lastReport=now; printStatus(); }
   draw(now); delay(1);
