@@ -209,12 +209,93 @@ void tickSensors(uint32_t now) {
     Serial.printf("STATE uptime_ms=%lu %s\n",(unsigned long)now,state.c_str()); previous=state;
   }
 }
+// Observation-only movement expectation supervisor. No relay or RF actuation.
+constexpr uint32_t START_TIMEOUT_MS=4000, STALL_TIMEOUT_MS=3000, TRAVEL_TIMEOUT_MS=45000;
+constexpr float START_DELTA_PCT=1.0f, REVERSE_DELTA_PCT=2.0f, PROGRESS_DELTA_PCT=0.8f;
+struct MovementExpectation {
+  bool active=false, started=false;
+  int direction=0;  // +1 expects opening, -1 expects closing
+  uint32_t requestedAt=0, lastProgressAt=0;
+  float initialPct=0, progressPct=0;
+} expected;
+
+void publishMovementEvent(const char *eventName, uint32_t now) {
+  const float angle=calibrated()?position*TRAVEL_DEG/100.0f:0.0f;
+  Serial.printf(
+    "EVENT {\"type\":\"%s\",\"uptime_ms\":%lu,\"angle_deg\":%.1f,"
+    "\"position_pct\":%.1f,\"closed_switch\":%s,\"open_switch\":null,"
+    "\"expected_direction\":\"%s\",\"elapsed_ms\":%lu,"
+    "\"settled\":%s,\"sensor_fault\":%s,\"source\":\"bench_simulation\"}\n",
+    eventName,(unsigned long)now,angle,constrain(position,0.0f,100.0f),
+    closedSwitch.stable?"true":"false",
+    expected.direction>0?"OPENING":expected.direction<0?"CLOSING":"NONE",
+    (unsigned long)(now-expected.requestedAt),
+    settled?"true":"false",sensorFault?"true":"false");
+}
+void startExpectation(int direction) {
+  uint32_t now=millis();
+  if(!calibrated() || sensorFault) {
+    message("Cannot simulate: calibration/fault");
+    return;
+  }
+  expected={};
+  expected.active=true;
+  expected.direction=direction;
+  expected.requestedAt=expected.lastProgressAt=now;
+  expected.initialPct=expected.progressPct=position;
+  Serial.printf("EXPECT uptime_ms=%lu direction=%s output=DISABLED\n",
+    (unsigned long)now,direction>0?"OPENING":"CLOSING");
+}
+void tickExpectation(uint32_t now) {
+  if(!expected.active || !calibrated()) return;
+  // Faults already qualified by the independent sensor subsystem.
+  if(sensorFault) {
+    publishMovementEvent("SENSOR_DISAGREE",now);
+    expected.active=false;
+    return;
+  }
+  bool reached=expected.direction>0 ?
+    settled && openAngle && !closedSwitch.stable :
+    settled && closedSwitch.stable && fabsf(position*TRAVEL_DEG/100.0f)<=ANGLE_TOLERANCE_DEG;
+  if(reached) {
+    Serial.printf("EXPECT_COMPLETE uptime_ms=%lu direction=%s elapsed_ms=%lu\n",
+      (unsigned long)now,expected.direction>0?"OPENING":"CLOSING",
+      (unsigned long)(now-expected.requestedAt));
+    expected.active=false;
+    return;
+  }
+  float signedFromStart=(position-expected.initialPct)*expected.direction;
+  float signedProgress=(position-expected.progressPct)*expected.direction;
+  if(signedFromStart<=-REVERSE_DELTA_PCT) {
+    publishMovementEvent("WRONG_DIRECTION",now);
+    expected.active=false;
+    return;
+  }
+  if(signedFromStart>=START_DELTA_PCT) expected.started=true;
+  if(signedProgress>=PROGRESS_DELTA_PCT) {
+    expected.progressPct=position;
+    expected.lastProgressAt=now;
+  }
+  if(!expected.started && now-expected.requestedAt>=START_TIMEOUT_MS) {
+    publishMovementEvent("NO_MOVEMENT",now);
+    expected.active=false;
+  } else if(expected.started && now-expected.lastProgressAt>=STALL_TIMEOUT_MS) {
+    publishMovementEvent(expected.direction>0?"STALLED_OPENING":"STALLED_CLOSING",now);
+    expected.active=false;
+  } else if(now-expected.requestedAt>=TRAVEL_TIMEOUT_MS) {
+    publishMovementEvent("TRAVEL_TIMEOUT",now);
+    expected.active=false;
+  }
+}
+
 void printStatus() {
   Serial.printf("raw=%.1f closedSwitch=%d calClosed=%d calOpen=%d calibrated=%d position=%.1f%% state=%s radio=%s requests=%lu settled=%d mismatchPending=%d fault=%d\n",
     filtered,closedSwitch.stable,closedRaw,openRaw,calibrated(),calibrated()?constrain(position,0.0f,100.0f):0,
     state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount,settled,mismatchPending,sensorFault);
 }
 void command(char c) {
+  if(c=='O' || c=='C') { startExpectation(c=='O'?1:-1); return; }
+  if(c=='K') { expected.active=false; message("Expectation cancelled"); return; }
   if(c=='c' || c=='o') {
     if(samples<50) { message("Wait for ADC settle"); return; }
     if(c=='c' && !closedSwitch.stable) { message("Close toggle first"); return; }
@@ -225,7 +306,7 @@ void command(char c) {
   } else if(c=='x') { prefs.clear(); closedRaw=openRaw=-1; resetMotion(); message("Calibration cleared"); }
   else if(c=='r') probeRadio();
   else if(c=='s') printStatus();
-  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; h=help");
+  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; O=expect open; C=expect close; K=cancel; h=help");
 }
 void draw(uint32_t now) {
   if(!displayOK || now-lastDraw<150) return;
@@ -274,7 +355,7 @@ void setup() {
   probeRadio(); command('h');
 }
 void loop() {
-  uint32_t now=millis(); tickSensors(now); tickButton(now);
+  uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now);
   while(Serial.available()) command(Serial.read());
   if(now-lastReport>=2000) { lastReport=now; printStatus(); }
   draw(now); delay(1);
