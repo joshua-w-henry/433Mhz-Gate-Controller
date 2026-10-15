@@ -24,7 +24,7 @@ uint32_t settledSince=0, mismatchSince=0;
 int motion=0; // -1 closing, 0 stationary, +1 opening
 // Movement decisions use a timed displacement window, rather than adjacent ADC readings.
 constexpr float MOTION_THRESHOLD_PCT=0.8f;
-constexpr uint32_t MOTION_WINDOW_MS=350, MOTION_CONFIRM_MS=250, MOTION_STOP_MS=900;
+constexpr uint32_t MOTION_WINDOW_MS=350, MOTION_CONFIRM_MS=700, MOTION_STOP_MS=900;
 float motionReference=0;
 uint32_t motionWindowAt=0, candidateAt=0, lastMove=0;
 int candidateMotion=0;
@@ -50,6 +50,27 @@ uint8_t taps=0;
 uint32_t downAt=0, armedAt=0;
 
 bool calibrated() { return closedRaw>=0 && openRaw>=0 && abs(openRaw-closedRaw)>=400; }
+// Operational fault is latched for the session until explicitly cleared.
+// Keep raw sensor health separate and never clear an active sensor problem.
+String operationFault="NONE";
+float faultAngle=0, faultPosition=0;
+bool faultClosed=false;
+uint32_t faultAt=0;
+bool faultAcknowledged=false;
+bool faultActive() { return sensorFault || operationFault!="NONE"; }
+void latchOperationFault(const char *name, uint32_t now) {
+  if(operationFault=="NONE") {
+    operationFault=name; faultAt=now;
+    faultAngle=calibrated()?position*TRAVEL_DEG/100.0f:0;
+    faultPosition=constrain(position,0.0f,100.0f);
+    faultClosed=closedSwitch.stable;
+    faultAcknowledged=false;
+    Serial.printf("FAULT_LATCHED type=%s angle_deg=%.1f position_pct=%.1f closed_switch=%d uptime_ms=%lu\n",
+      name,faultAngle,faultPosition,faultClosed,(unsigned long)now);
+  }
+}
+
+
 void message(const String &s) { notice=s; noticeAt=millis(); Serial.println(s); }
 void activateBench() {
   ++activationCount;
@@ -209,12 +230,125 @@ void tickSensors(uint32_t now) {
     Serial.printf("STATE uptime_ms=%lu %s\n",(unsigned long)now,state.c_str()); previous=state;
   }
 }
+// Observation-only movement expectation supervisor. No relay or RF actuation.
+constexpr uint32_t START_TIMEOUT_MS=5000, STALL_TIMEOUT_MS=5000, TRAVEL_TIMEOUT_MS=45000;
+// Require at least ~5 degrees of confirmed travel before classifying a stall.
+constexpr float START_DELTA_PCT=100.0f*ANGLE_TOLERANCE_DEG/TRAVEL_DEG;
+constexpr float REVERSE_DELTA_PCT=START_DELTA_PCT, PROGRESS_DELTA_PCT=0.8f;
+struct MovementExpectation {
+  bool active=false, started=false;
+  int direction=0;  // +1 expects opening, -1 expects closing
+  uint32_t requestedAt=0, lastProgressAt=0;
+  float initialPct=0, progressPct=0;
+} expected;
+
+void publishMovementEvent(const char *eventName, uint32_t now) {
+  const float angle=calibrated()?position*TRAVEL_DEG/100.0f:0.0f;
+  Serial.printf(
+    "EVENT {\"type\":\"%s\",\"uptime_ms\":%lu,\"angle_deg\":%.1f,"
+    "\"position_pct\":%.1f,\"closed_switch\":%s,\"open_switch\":null,"
+    "\"expected_direction\":\"%s\",\"elapsed_ms\":%lu,"
+    "\"settled\":%s,\"sensor_fault\":%s,\"source\":\"bench_simulation\"}\n",
+    eventName,(unsigned long)now,angle,constrain(position,0.0f,100.0f),
+    closedSwitch.stable?"true":"false",
+    expected.direction>0?"OPENING":expected.direction<0?"CLOSING":"NONE",
+    (unsigned long)(now-expected.requestedAt),
+    settled?"true":"false",sensorFault?"true":"false");
+}
+void startExpectation(int direction) {
+  uint32_t now=millis();
+  if(!calibrated() || faultActive()) {
+    message("Cannot simulate: calibration/fault");
+    return;
+  }
+  expected={};
+  expected.active=true;
+  expected.direction=direction;
+  expected.requestedAt=expected.lastProgressAt=now;
+  expected.initialPct=expected.progressPct=position;
+  Serial.printf("EXPECT uptime_ms=%lu direction=%s output=DISABLED\n",
+    (unsigned long)now,direction>0?"OPENING":"CLOSING");
+}
+void tickExpectation(uint32_t now) {
+  if(!expected.active || !calibrated()) return;
+  // Faults already qualified by the independent sensor subsystem.
+  if(sensorFault) {
+    publishMovementEvent("SENSOR_DISAGREE",now);
+    expected.active=false;
+    return;
+  }
+  bool reached=expected.direction>0 ?
+    settled && openAngle && !closedSwitch.stable :
+    settled && closedSwitch.stable && fabsf(position*TRAVEL_DEG/100.0f)<=ANGLE_TOLERANCE_DEG;
+  if(reached) {
+    Serial.printf("EXPECT_COMPLETE uptime_ms=%lu direction=%s elapsed_ms=%lu\n",
+      (unsigned long)now,expected.direction>0?"OPENING":"CLOSING",
+      (unsigned long)(now-expected.requestedAt));
+    expected.active=false;
+    return;
+  }
+  float signedFromStart=(position-expected.initialPct)*expected.direction;
+  float signedProgress=(position-expected.progressPct)*expected.direction;
+  if(signedFromStart<=-REVERSE_DELTA_PCT) {
+    publishMovementEvent("WRONG_DIRECTION",now);
+    latchOperationFault("WRONG_DIRECTION",now);
+    expected.active=false;
+    return;
+  }
+  // A closed switch still asserted rules out confirmed opening travel.
+  // Noise near either endpoint must not turn NO_MOVEMENT into STALLED.
+  bool startConfirmed=signedFromStart>=START_DELTA_PCT &&
+    (expected.direction<0 || !closedSwitch.stable);
+  if(!expected.started && startConfirmed) {
+    expected.started=true;
+    expected.progressPct=position;
+    expected.lastProgressAt=now;
+    Serial.printf("EXPECT_STARTED uptime_ms=%lu angle_deg=%.1f closed_switch=%d\n",
+      (unsigned long)now,position*TRAVEL_DEG/100.0f,closedSwitch.stable);
+  }
+  if(expected.started && signedProgress>=PROGRESS_DELTA_PCT) {
+    expected.progressPct=position;
+    expected.lastProgressAt=now;
+  }
+  if(!expected.started && now-expected.requestedAt>=START_TIMEOUT_MS) {
+    publishMovementEvent("NO_MOVEMENT",now);
+    latchOperationFault("NO_MOVEMENT",now);
+    expected.active=false;
+  } else if(expected.started && now-expected.lastProgressAt>=STALL_TIMEOUT_MS) {
+    const char *fault=expected.direction>0?"STALLED_OPENING":"STALLED_CLOSING";
+    publishMovementEvent(fault,now);
+    latchOperationFault(fault,now);
+    expected.active=false;
+  } else if(now-expected.requestedAt>=TRAVEL_TIMEOUT_MS) {
+    publishMovementEvent("TRAVEL_TIMEOUT",now);
+    latchOperationFault("TRAVEL_TIMEOUT",now);
+    expected.active=false;
+  }
+}
+
 void printStatus() {
-  Serial.printf("raw=%.1f closedSwitch=%d calClosed=%d calOpen=%d calibrated=%d position=%.1f%% state=%s radio=%s requests=%lu settled=%d mismatchPending=%d fault=%d\n",
+  Serial.printf("raw=%.1f closedSwitch=%d calClosed=%d calOpen=%d calibrated=%d position=%.1f%% state=%s radio=%s requests=%lu settled=%d mismatchPending=%d sensorFault=%d operationFault=%s faultActive=%d acknowledged=%d\n",
     filtered,closedSwitch.stable,closedRaw,openRaw,calibrated(),calibrated()?constrain(position,0.0f,100.0f):0,
-    state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount,settled,mismatchPending,sensorFault);
+    state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount,settled,mismatchPending,sensorFault,operationFault.c_str(),faultActive(),faultAcknowledged);
 }
 void command(char c) {
+  if(c=='A') {
+    if(!faultActive()) { message("No fault to acknowledge"); return; }
+    faultAcknowledged=true;
+    message("Fault acknowledged (still active)");
+    return;
+  }
+  if(c=='F') {
+    if(expected.active || sensorFault || mismatchPending) {
+      message("Cannot clear: active expectation or sensor problem");
+      return;
+    }
+    operationFault="NONE"; faultAcknowledged=false;
+    message("Operational fault cleared");
+    return;
+  }
+  if(c=='O' || c=='C') { startExpectation(c=='O'?1:-1); return; }
+  if(c=='K') { expected.active=false; message("Expectation cancelled"); return; }
   if(c=='c' || c=='o') {
     if(samples<50) { message("Wait for ADC settle"); return; }
     if(c=='c' && !closedSwitch.stable) { message("Close toggle first"); return; }
@@ -225,19 +359,28 @@ void command(char c) {
   } else if(c=='x') { prefs.clear(); closedRaw=openRaw=-1; resetMotion(); message("Calibration cleared"); }
   else if(c=='r') probeRadio();
   else if(c=='s') printStatus();
-  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; h=help");
+  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; O=expect open; C=expect close; K=cancel; A=ack; F=clear fault; h=help");
 }
 void draw(uint32_t now) {
   if(!displayOK || now-lastDraw<150) return;
   lastDraw=now; oled.clearDisplay(); oled.setTextSize(1); oled.setTextColor(SSD1306_WHITE); oled.setCursor(0,0);
   oled.println("MM571 GATE / BENCH v1");
-  if(armed) {
+  if(faultActive()) {
+    oled.println("!! GATE FAULT !!");
+    oled.println(sensorFault?"SENSOR DISAGREE":operationFault);
+    oled.printf("Now: %.1f deg\n",constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f);
+    if(operationFault!="NONE") {
+      oled.printf("At fault: %.1f deg\n",faultAngle);
+      oled.printf("Closed: %s\n",faultClosed?"YES":"NO");
+    }
+    oled.println(faultAcknowledged?"ACK / STILL ACTIVE":"A=ACK  F=CLEAR");
+  } else if(armed) {
     oled.println("ACTUATE: PRESS 3x"); oled.printf("Count: %u/3\n",taps);
     oled.printf("Time: %lus\n",(unsigned long)((5000-(now-armedAt)+999)/1000));
     oled.println("Relay DISABLED");
   } else if(page==0) {
     oled.println(state);
-    if(calibrated()) { oled.printf("Angle: %.1f deg\n",constrain(position,0.0f,100.0f)*TRAVEL_DEG/100); oled.printf("Travel: %.1f %%\n",position); }
+    if(calibrated()) { oled.printf("Angle: %.1f deg\n",constrain(position,0.0f,100.0f)*TRAVEL_DEG/100); oled.printf("Travel: %.1f %%\n",constrain(position,0.0f,100.0f)); }
     else { oled.println("Angle: NOT CALIBRATED"); oled.printf("Raw ADC: %.0f\n",filtered); }
     oled.printf("Closed input: %s\n",closedSwitch.stable?"ON":"OFF");
     oled.println("Power: USB / batt N/A");
@@ -274,7 +417,7 @@ void setup() {
   probeRadio(); command('h');
 }
 void loop() {
-  uint32_t now=millis(); tickSensors(now); tickButton(now);
+  uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now);
   while(Serial.available()) command(Serial.read());
   if(now-lastReport>=2000) { lastReport=now; printStatus(); }
   draw(now); delay(1);
