@@ -211,7 +211,9 @@ void tickSensors(uint32_t now) {
 }
 // Observation-only movement expectation supervisor. No relay or RF actuation.
 constexpr uint32_t START_TIMEOUT_MS=4000, STALL_TIMEOUT_MS=3000, TRAVEL_TIMEOUT_MS=45000;
-constexpr float START_DELTA_PCT=1.0f, REVERSE_DELTA_PCT=2.0f, PROGRESS_DELTA_PCT=0.8f;
+// Require at least ~5 degrees of confirmed travel before classifying a stall.
+constexpr float START_DELTA_PCT=100.0f*ANGLE_TOLERANCE_DEG/TRAVEL_DEG;
+constexpr float REVERSE_DELTA_PCT=START_DELTA_PCT, PROGRESS_DELTA_PCT=0.8f;
 struct MovementExpectation {
   bool active=false, started=false;
   int direction=0;  // +1 expects opening, -1 expects closing
@@ -271,8 +273,18 @@ void tickExpectation(uint32_t now) {
     expected.active=false;
     return;
   }
-  if(signedFromStart>=START_DELTA_PCT) expected.started=true;
-  if(signedProgress>=PROGRESS_DELTA_PCT) {
+  // A closed switch still asserted rules out confirmed opening travel.
+  // Noise near either endpoint must not turn NO_MOVEMENT into STALLED.
+  bool startConfirmed=signedFromStart>=START_DELTA_PCT &&
+    (expected.direction<0 || !closedSwitch.stable);
+  if(!expected.started && startConfirmed) {
+    expected.started=true;
+    expected.progressPct=position;
+    expected.lastProgressAt=now;
+    Serial.printf("EXPECT_STARTED uptime_ms=%lu angle_deg=%.1f closed_switch=%d\\n",
+      (unsigned long)now,position*TRAVEL_DEG/100.0f,closedSwitch.stable);
+  }
+  if(expected.started && signedProgress>=PROGRESS_DELTA_PCT) {
     expected.progressPct=position;
     expected.lastProgressAt=now;
   }
