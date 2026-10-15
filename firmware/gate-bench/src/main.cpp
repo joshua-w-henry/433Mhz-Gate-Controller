@@ -14,6 +14,23 @@ constexpr float TRAVEL_DEG=90.0f; // Display scale only; change for actual hinge
 Adafruit_SSD1306 oled(128,64,&Wire,-1);
 Preferences prefs;
 CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
+volatile uint32_t gdo2Edges=0, gdo2HighEdges=0;
+void IRAM_ATTR gdo2EdgeMonitor() {
+  ++gdo2Edges;
+  if(digitalRead(RF_GDO2_PIN)) ++gdo2HighEdges;
+}
+void beginGdo2Monitor() {
+  pinMode(RF_GDO2_PIN,INPUT);
+  attachInterrupt(digitalPinToInterrupt(RF_GDO2_PIN),gdo2EdgeMonitor,CHANGE);
+}
+void logGdo2Monitor(const char *site, uint32_t beforeEdges, uint32_t beforeHigh) {
+  noInterrupts();
+  uint32_t edges=gdo2Edges, high=gdo2HighEdges;
+  interrupts();
+  Serial.printf("RF_GDO2_TRACE site=%s edges=%lu rising=%lu level=%d\n",
+    site,(unsigned long)(edges-beforeEdges),(unsigned long)(high-beforeHigh),digitalRead(RF_GDO2_PIN));
+}
+
 volatile bool radioPacketPending=false;
 void onRadioPacket() { radioPacketPending=true; }
 bool linkOK=false;
@@ -161,6 +178,7 @@ void startBenchLink() {
     rc=packetRadio.startReceive();
   }
   linkOK=(rc==RADIOLIB_ERR_NONE);
+  beginGdo2Monitor();
   Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
 }
 void tickBenchLink() {
@@ -175,7 +193,11 @@ void tickBenchLink() {
     // BENCHPING is deliberately not an actuation request and has no authority.
     if(validBenchPing(packet)) {
       String reply="BENCHACK:"+packet.substring(10);
+      uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
+      radioPacketPending=false; // RX GDO0 can also toggle during a TX transition
       int tx=packetRadio.transmit(reply);
+      logGdo2Monitor("gate_ack",edgeBefore,highBefore);
+      radioPacketPending=false;
       if(tx==RADIOLIB_ERR_NONE) ++rfAck;
       Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
       if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
