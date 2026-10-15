@@ -14,9 +14,16 @@ Preferences prefs;
 bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
 int page=0, closedRaw=-1, openRaw=-1;
-float filtered=0, position=0, motionAnchor=0;
+float filtered=0, position=0;
 int motion=0; // -1 closing, 0 stationary, +1 opening
-uint32_t lastMove=0, lastSample=0, lastDraw=0, lastReport=0, samples=0;
+// Movement decisions use a timed displacement window, rather than adjacent ADC readings.
+constexpr float MOTION_THRESHOLD_PCT=0.8f;
+constexpr uint32_t MOTION_WINDOW_MS=350, MOTION_CONFIRM_MS=250, MOTION_STOP_MS=900;
+float motionReference=0;
+uint32_t motionWindowAt=0, candidateAt=0, lastMove=0;
+int candidateMotion=0;
+bool motionInitialized=false;
+uint32_t lastSample=0, lastDraw=0, lastReport=0, samples=0;
 String state="STARTING", notice="";
 uint32_t noticeAt=0, activationCount=0;
 
@@ -101,7 +108,51 @@ void probeRadio() {
   Serial.printf("CC1101 SPI %s PART=0x%02X VERSION=0x%02X (RF idle)\n",radioOK?"PASS":"FAIL",radioPart,radioVersion);
 }
 
-void resetMotion() { motion=0; motionAnchor=position; lastMove=millis(); }
+void resetMotion() {
+  motion=0;
+  candidateMotion=0;
+  candidateAt=0;
+  motionReference=position;
+  motionWindowAt=millis();
+  lastMove=millis();
+  motionInitialized=false;
+}
+
+void tickMotion(uint32_t now) {
+  if(!motionInitialized) {
+    motionReference=position;
+    motionWindowAt=lastMove=now;
+    motionInitialized=true;
+    return;
+  }
+  if(now-motionWindowAt < MOTION_WINDOW_MS) {
+    if(motion!=0 && now-lastMove>=MOTION_STOP_MS) motion=0;
+    return;
+  }
+  float displacement=position-motionReference;
+  int observed=displacement>=MOTION_THRESHOLD_PCT?1:
+               displacement<=-MOTION_THRESHOLD_PCT?-1:0;
+  // A sufficiently large displacement keeps a moving state alive, but
+  // a new/reversed direction must remain consistent for confirmation.
+  if(observed!=0) {
+    lastMove=now;
+    if(observed==motion) {
+      candidateMotion=0;
+    } else if(observed!=candidateMotion) {
+      candidateMotion=observed;
+      candidateAt=now;
+    } else if(now-candidateAt>=MOTION_CONFIRM_MS) {
+      motion=observed;
+      candidateMotion=0;
+    }
+  } else {
+    candidateMotion=0;
+  }
+  motionReference=position;
+  motionWindowAt=now;
+  if(now-lastMove>=MOTION_STOP_MS) motion=0;
+}
+
 void tickSensors(uint32_t now) {
   closedSwitch.tick(now);
   if(now-lastSample<20) return;
@@ -109,17 +160,19 @@ void tickSensors(uint32_t now) {
   int raw=analogRead(POT_PIN);
   filtered=samples==0?raw:filtered+0.18f*(raw-filtered); ++samples;
   if(calibrated()) {
+    // Preserve the unrestricted reading for disagreement/fault detection.
     position=100.0f*(filtered-closedRaw)/(openRaw-closedRaw);
-    float delta=position-motionAnchor;
-    if(fabsf(delta)>=0.8f) { motion=delta>0?1:-1; motionAnchor=position; lastMove=now; }
-    if(now-lastMove>900) motion=0;
+    tickMotion(now);
     if(position < -8 || position >108 || (closedSwitch.stable && fabsf(position)>5)) state="SENSOR DISAGREE";
     else if(closedSwitch.stable) state="CLOSED";
     else if(motion>0) state="OPENING";
     else if(motion<0) state="CLOSING";
     else if(fabsf(position-100)<=2) state="OPEN (ANGLE)";
     else state="STOPPED BETWEEN";
-  } else state=closedSwitch.stable?"CLOSED":"UNCALIBRATED";
+  } else {
+    if(motionInitialized) resetMotion();
+    state=closedSwitch.stable?"CLOSED":"UNCALIBRATED";
+  }
   static String previous="";
   if(state!=previous) {
     Serial.printf("STATE uptime_ms=%lu %s\n",(unsigned long)now,state.c_str()); previous=state;
@@ -127,7 +180,7 @@ void tickSensors(uint32_t now) {
 }
 void printStatus() {
   Serial.printf("raw=%.1f closedSwitch=%d calClosed=%d calOpen=%d calibrated=%d position=%.1f%% state=%s radio=%s requests=%lu\n",
-    filtered,closedSwitch.stable,closedRaw,openRaw,calibrated(),calibrated()?position:0,
+    filtered,closedSwitch.stable,closedRaw,openRaw,calibrated(),calibrated()?constrain(position,0.0f,100.0f):0,
     state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount);
 }
 void command(char c) {
@@ -153,7 +206,7 @@ void draw(uint32_t now) {
     oled.println("Relay DISABLED");
   } else if(page==0) {
     oled.println(state);
-    if(calibrated()) { oled.printf("Angle: %.1f deg\n",position*TRAVEL_DEG/100); oled.printf("Travel: %.1f %%\n",position); }
+    if(calibrated()) { oled.printf("Angle: %.1f deg\n",constrain(position,0.0f,100.0f)*TRAVEL_DEG/100); oled.printf("Travel: %.1f %%\n",position); }
     else { oled.println("Angle: NOT CALIBRATED"); oled.printf("Raw ADC: %.0f\n",filtered); }
     oled.printf("Closed input: %s\n",closedSwitch.stable?"ON":"OFF");
     oled.println("Power: USB / batt N/A");
