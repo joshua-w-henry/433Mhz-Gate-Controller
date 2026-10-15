@@ -22,6 +22,7 @@ String banner="";
 CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
 bool linkOK=false;
 uint32_t benchPingSeq=0;
+void wakeScreen();
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
   String ping="BENCHPING:"+String(++benchPingSeq);
