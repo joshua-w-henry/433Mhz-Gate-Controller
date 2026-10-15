@@ -48,6 +48,17 @@ void mobileRfDiagnostics(const char *site) {
   Serial.printf("RF_DIAG site=%s spi=%d GDO0=%d GDO2=%d MARCSTATE=0x%02X TXBYTES=0x%02X RXBYTES=0x%02X\n",
     site,ok,digitalRead(RF_GDO0_PIN),digitalRead(RF_GDO2_PIN),marc,txBytes,rxBytes);
 }
+void printRfConfig() {
+  const uint8_t addrs[]={0x00,0x02,0x06,0x07,0x08,0x0B,0x0C,0x0D,0x0E,0x0F,0x10,0x11,0x12,0x13,0x15,0x18,0x19,0x1B,0x21,0x22};
+  const char* names[]={"IOCFG2","IOCFG0","PKTLEN","PKTCTRL1","PKTCTRL0","FSCTRL1","FSCTRL0","FREQ2","FREQ1","FREQ0","MDMCFG4","MDMCFG3","MDMCFG2","MDMCFG1","DEVIATN","MCSM0","FOCCFG","AGCCTRL2","FREND1","FREND0"};
+  Serial.println("RF_CONFIG_BEGIN");
+  for(unsigned i=0;i<sizeof(addrs);++i) {
+    uint8_t v=0;
+    bool ok=regRead(addrs[i],v);
+    Serial.printf("RF_REG %s=0x%02X ok=%d\n",names[i],v,ok);
+  }
+  Serial.println("RF_CONFIG_END");
+}
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
   String ping="BENCHPING:"+String(++benchPingSeq);
@@ -158,7 +169,8 @@ void loop() {
   else if(a) requestBench("ACTIVATE");
   while(Serial.available()) {
     char c=Serial.read();
-    if(c=='p') sendBenchPing();
+    if(c=='d') printRfConfig();
+    else if(c=='p') sendBenchPing();
     else if(c=='a') requestBench("ACTIVATE");
     else if(c=='s') { page=(page+1)%2; requestBench("STATUS"); }
     else if(c=='r') { wakeScreen(); probeRadio(); }
