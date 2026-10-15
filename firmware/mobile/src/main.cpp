@@ -39,6 +39,8 @@ void logGdo2Monitor(const char *site, uint32_t beforeEdges, uint32_t beforeHigh)
 
 bool linkOK=false;
 uint32_t benchPingSeq=0;
+volatile bool mobileRxPending=false;
+void IRAM_ATTR onMobileRadioPacket() { mobileRxPending=true; }
 void wakeScreen();
 void mobileRfDiagnostics(const char *site) {
   uint8_t marc=0,txBytes=0,rxBytes=0;
@@ -55,10 +57,30 @@ void sendBenchPing() {
   Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
   if(sent!=RADIOLIB_ERR_NONE) mobileRfDiagnostics("mobile_ping_tx_error");
   if(sent==RADIOLIB_ERR_NONE) {
-    String reply;
-    int rx=packetRadio.receive(reply,1200);
-    if(rx==RADIOLIB_ERR_NONE) Serial.printf("RF_REPLY payload=%s rssi=%.1f\n",reply.c_str(),packetRadio.getRSSI());
-    else { Serial.printf("RF_REPLY_TIMEOUT code=%d\n",rx); mobileRfDiagnostics("mobile_reply_rx_error"); }
+    mobileRxPending=false;
+    packetRadio.setPacketReceivedAction(onMobileRadioPacket);
+    int rxStart=packetRadio.startReceive();
+    Serial.printf("RF_RX_ARM code=%d GDO0=%d\n",rxStart,digitalRead(RF_GDO0_PIN));
+    bool gotReply=false;
+    uint32_t waitStart=millis();
+    while(rxStart==RADIOLIB_ERR_NONE && millis()-waitStart<1200) {
+      if(mobileRxPending) {
+        mobileRxPending=false;
+        String reply;
+        int rx=packetRadio.readData(reply);
+        if(rx==RADIOLIB_ERR_NONE && reply=="BENCHACK:"+String(benchPingSeq)) {
+          Serial.printf("RF_REPLY payload=%s rssi=%.1f\n",reply.c_str(),packetRadio.getRSSI());
+          gotReply=true;
+          break;
+        }
+        Serial.printf("RF_REPLY_IGNORED code=%d len=%u\n",rx,(unsigned)reply.length());
+        packetRadio.startReceive();
+      }
+      delay(1);
+    }
+    packetRadio.standby();
+    packetRadio.clearPacketReceivedAction();
+    if(!gotReply) { Serial.println("RF_REPLY_TIMEOUT"); mobileRfDiagnostics("mobile_reply_rx_error"); }
   }
   wakeScreen();
   banner="RF PING TEST"; messageAt=millis();
