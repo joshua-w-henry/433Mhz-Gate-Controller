@@ -32,7 +32,8 @@ void logGdo2Monitor(const char *site, uint32_t beforeEdges, uint32_t beforeHigh)
 }
 
 volatile bool radioPacketPending=false;
-void onRadioPacket() { radioPacketPending=true; }
+volatile uint32_t gateRxIrqs=0;
+void IRAM_ATTR onRadioPacket() { radioPacketPending=true; ++gateRxIrqs; }
 bool linkOK=false;
 uint32_t rfRx=0, rfAck=0;
 bool displayOK=false, radioOK=false;
@@ -180,6 +181,13 @@ void startBenchLink() {
   linkOK=(rc==RADIOLIB_ERR_NONE);
   beginGdo2Monitor();
   Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
+}
+void benchRxStatus(const char* context) {
+  uint8_t marc=0, rxBytes=0, iocfg0=0;
+  bool ok=regRead(0x35,marc,true) && regRead(0x3B,rxBytes,true) && regRead(0x02,iocfg0);
+  Serial.printf("RF_RX_STATUS where=%s spi=%d irq_count=%lu pending=%d GDO0=%d MARCSTATE=0x%02X RXBYTES=0x%02X IOCFG0=0x%02X\n",
+    context,ok,(unsigned long)gateRxIrqs,radioPacketPending,
+    digitalRead(RF_GDO0_PIN),marc,rxBytes,iocfg0);
 }
 void tickBenchLink() {
   if(!linkOK || !radioPacketPending) return;
@@ -405,6 +413,8 @@ void printStatus() {
     state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount,settled,mismatchPending,sensorFault,operationFault.c_str(),faultActive(),faultAcknowledged);
 }
 void command(char c) {
+  if(c=='d') { benchRxStatus("manual"); return; }
+  if(c=='R') { radioPacketPending=false; packetRadio.standby(); int rc=packetRadio.startReceive(); Serial.printf("RF_RX_RESET code=%d\n",rc); benchRxStatus("reset"); return; }
   if(c=='A') {
     if(!faultActive()) { message("No fault to acknowledge"); return; }
     faultAcknowledged=true;
@@ -432,7 +442,7 @@ void command(char c) {
   } else if(c=='x') { prefs.clear(); closedRaw=openRaw=-1; resetMotion(); message("Calibration cleared"); }
   else if(c=='r') probeRadio();
   else if(c=='s') printStatus();
-  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; O=expect open; C=expect close; K=cancel; A=ack; F=clear fault; h=help");
+  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; O=expect open; C=expect close; K=cancel; A=ack; F=clear fault; d=RF status; R=reset RX; h=help");
 }
 void draw(uint32_t now) {
   if(!displayOK || now-lastDraw<150) return;
