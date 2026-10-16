@@ -44,7 +44,18 @@ volatile uint32_t gateRxIrqs=0;
 void IRAM_ATTR onRadioPacket() { radioPacketPending=true; ++gateRxIrqs; }
 bool linkOK=false;
 uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
+uint32_t rfCrcErrors=0, rfAckErrors=0, rfRearmErrors=0;
+uint32_t rfUnique=0;
 String lastPing="";
+uint32_t seenIDs[64]={};
+uint8_t seenCount=0, seenNext=0;
+bool seenBenchID(uint32_t id) {
+  for(uint8_t i=0;i<seenCount;i++) if(seenIDs[i]==id) return true;
+  seenIDs[seenNext]=id;
+  seenNext=(seenNext+1)%64;
+  if(seenCount<64) ++seenCount;
+  return false;
+}
 float lastRfRssi=0;
 bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
@@ -125,9 +136,10 @@ void tcpReply(String cmd) {
       state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
       closedSwitch.stable,sensorFault,operationFault.c_str());
   } else if(cmd=="rf") {
-    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu rssi=%.1f irq=%lu\n",
+    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu unique=%lu crc=%lu ack_error=%lu rearm_error=%lu rssi=%.1f irq=%lu\n",
       (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
-      (unsigned long)rfRejected,lastRfRssi,(unsigned long)gateRxIrqs);
+      (unsigned long)rfRejected,(unsigned long)rfUnique,(unsigned long)rfCrcErrors,
+      (unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,lastRfRssi,(unsigned long)gateRxIrqs);
   } else if(cmd=="logs") {
     for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
   } else if(cmd=="quit") benchClient.stop();
@@ -282,7 +294,9 @@ void tickBenchLink() {
       packet.c_str(),packetRadio.getRSSI(),(unsigned long)rfRx);
     // BENCHPING is deliberately not an actuation request and has no authority.
     if(validBenchPing(packet)) {
-      if(packet==lastPing) ++rfDuplicates;
+      uint32_t requestID=strtoul(packet.c_str()+10,nullptr,10);
+      if(seenBenchID(requestID)) ++rfDuplicates;
+      else ++rfUnique;
       lastPing=packet;
       String reply="BENCHACK:"+packet.substring(10);
       uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
@@ -292,13 +306,15 @@ void tickBenchLink() {
       logGdo2Monitor("gate_ack",edgeBefore,highBefore);
       radioPacketPending=false;
       if(tx==RADIOLIB_ERR_NONE) ++rfAck;
+      else ++rfAckErrors;
       storeRf(String("ACK ")+reply+" code="+String(tx));
       Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
       if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
     } else { ++rfRejected; storeRf("REJECT malformed"); Serial.println("RF_RX_IGNORED malformed bench packet"); }
-  } else Serial.printf("RF_RX_ERROR code=%d\n",rc);
+  } else { if(rc==RADIOLIB_ERR_CRC_MISMATCH) ++rfCrcErrors;
+    storeRf(String("RX_ERROR ")+String(rc)); Serial.printf("RF_RX_ERROR code=%d\n",rc); }
   int rr=packetRadio.startReceive();
-  if(rr!=RADIOLIB_ERR_NONE) Serial.printf("RF_REARM_ERROR code=%d\n",rr);
+  if(rr!=RADIOLIB_ERR_NONE) { ++rfRearmErrors; Serial.printf("RF_REARM_ERROR code=%d\n",rr); }
 }
 
 void resetMotion() {
