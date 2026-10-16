@@ -112,6 +112,7 @@ WiFiServer benchServer(2323);
 WiFiClient benchClient;
 String tcpCommand="";
 uint32_t wifiLastAttempt=0;
+bool wifiWasConnected=false;
 void storeRf(const String &event) {
   rfHistory[historyAt]=String(millis())+" "+event;
   historyAt=(historyAt+1)%20;
@@ -135,9 +136,11 @@ void tcpReply(String cmd) {
 void tickTcp() {
 #if GATE_WIFI_ENABLED
   if(WiFi.status()!=WL_CONNECTED) {
+    wifiWasConnected=false;
     if(millis()-wifiLastAttempt>=10000) { wifiLastAttempt=millis(); WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD); }
     return;
   }
+  if(!wifiWasConnected) { wifiWasConnected=true; Serial.printf("GATE_TCP_CONNECTED ip=%s port=2323\n",WiFi.localIP().toString().c_str()); }
   if(!benchClient || !benchClient.connected()) {
     benchClient.stop();
     benchClient=benchServer.available();
