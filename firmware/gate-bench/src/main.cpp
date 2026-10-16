@@ -46,6 +46,8 @@ void IRAM_ATTR onRadioPacket() { radioPacketPending=true; ++gateRxIrqs; }
 bool linkOK=false;
 uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
 uint32_t rfCrcErrors=0, rfAckErrors=0, rfRearmErrors=0;
+uint32_t rfEmpty=0, rfOversize=0, rfRecoveries=0, rfRxErrors=0;
+constexpr size_t BENCH_MAX_PACKET=24;
 uint32_t rfUnique=0;
 String lastPing="";
 uint32_t seenIDs[64]={};
@@ -138,10 +140,11 @@ void tcpReply(String cmd) {
       state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
       closedSwitch.stable,sensorFault,operationFault.c_str());
   } else if(cmd=="rf") {
-    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu unique=%lu crc=%lu ack_error=%lu rearm_error=%lu rssi=%.1f irq=%lu\n",
+    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu unique=%lu crc=%lu empty=%lu oversize=%lu rx_error=%lu recoveries=%lu ack_error=%lu rearm_error=%lu rssi=%.1f irq=%lu\n",
       (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
       (unsigned long)rfRejected,(unsigned long)rfUnique,(unsigned long)rfCrcErrors,
-      (unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,lastRfRssi,(unsigned long)gateRxIrqs);
+      (unsigned long)rfEmpty,(unsigned long)rfOversize,(unsigned long)rfRxErrors,
+      (unsigned long)rfRecoveries,(unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,lastRfRssi,(unsigned long)gateRxIrqs);
   } else if(cmd=="logs") {
     for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
   } else if(cmd=="quit") benchClient.stop();
@@ -311,39 +314,76 @@ void benchRxStatus(const char* context) {
     context,ok,(unsigned long)gateRxIrqs,radioPacketPending,
     digitalRead(RF_GDO0_PIN),marc,rxBytes,iocfg0);
 }
+void recoverBenchReceiver(const char *reason) {
+  ++rfRecoveries;
+  radioPacketPending=false;
+  int stop=packetRadio.standby();
+  int arm=packetRadio.startReceive();
+  if(arm!=RADIOLIB_ERR_NONE) ++rfRearmErrors;
+  Serial.printf("RF_RECOVERY reason=%s standby=%d rearm=%d\n",reason,stop,arm);
+  storeRf(String("RECOVERY ")+reason+" stop="+String(stop)+" arm="+String(arm));
+  linkOK=(arm==RADIOLIB_ERR_NONE);
+}
 void tickBenchLink() {
   if(!linkOK || !radioPacketPending) return;
   radioPacketPending=false;
+  // CC1101 getPacketLength() consumes the length byte; call it exactly
+  // once before readData() and reject all oversized frames.
+  size_t len=packetRadio.getPacketLength();
+  if(len==0 || len>BENCH_MAX_PACKET) {
+    ++rfRejected;
+    if(!len) ++rfEmpty; else ++rfOversize;
+    Serial.printf("RF_RX_BAD_LENGTH len=%u\n",(unsigned)len);
+    storeRf(String("BAD_LENGTH ")+String((unsigned)len));
+    recoverBenchReceiver("bad_length");
+    return;
+  }
+  uint8_t bytes[BENCH_MAX_PACKET+1]={0};
+  int rc=packetRadio.readData(bytes,len);
+  if(rc!=RADIOLIB_ERR_NONE) {
+    ++rfRxErrors;
+    if(rc==RADIOLIB_ERR_CRC_MISMATCH) ++rfCrcErrors;
+    Serial.printf("RF_RX_ERROR code=%d len=%u\n",rc,(unsigned)len);
+    storeRf(String("RX_ERROR ")+String(rc)+" len="+String((unsigned)len));
+    recoverBenchReceiver("read_error");
+    return;
+  }
+  ++rfRx;
+  lastRfRssi=packetRadio.getRSSI();
+  String hex;
+  for(size_t i=0;i<len;i++) {
+    if(i) hex+=' ';
+    if(bytes[i]<16) hex+='0';
+    hex+=String(bytes[i],HEX);
+  }
   String packet;
-  int rc=packetRadio.readData(packet);
-  if(rc==RADIOLIB_ERR_NONE) {
-    ++rfRx;
-    lastRfRssi=packetRadio.getRSSI(); storeRf(String("RX ")+packet);
-    Serial.printf("RF_RX payload=%s rssi=%.1f count=%lu\n",
-      packet.c_str(),packetRadio.getRSSI(),(unsigned long)rfRx);
-    // BENCHPING is deliberately not an actuation request and has no authority.
-    if(validBenchPing(packet)) {
-      uint32_t requestID=strtoul(packet.c_str()+10,nullptr,10);
-      if(seenBenchID(requestID)) ++rfDuplicates;
-      else ++rfUnique;
-      lastPing=packet;
-      String reply="BENCHACK:"+packet.substring(10);
-      uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
-      radioPacketPending=false; // RX GDO0 can also toggle during a TX transition
-      delay(120); // Bench turnaround: allow mobile to finish TX and arm RX.
-      int tx=packetRadio.transmit(reply);
-      logGdo2Monitor("gate_ack",edgeBefore,highBefore);
-      radioPacketPending=false;
-      if(tx==RADIOLIB_ERR_NONE) ++rfAck;
-      else ++rfAckErrors;
-      storeRf(String("ACK ")+reply+" code="+String(tx));
-      Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
-      if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
-    } else { ++rfRejected; storeRf("REJECT malformed"); Serial.println("RF_RX_IGNORED malformed bench packet"); }
-  } else { if(rc==RADIOLIB_ERR_CRC_MISMATCH) ++rfCrcErrors;
-    storeRf(String("RX_ERROR ")+String(rc)); Serial.printf("RF_RX_ERROR code=%d\n",rc); }
-  int rr=packetRadio.startReceive();
-  if(rr!=RADIOLIB_ERR_NONE) { ++rfRearmErrors; Serial.printf("RF_REARM_ERROR code=%d\n",rr); }
+  for(size_t i=0;i<len;i++) packet+=(char)bytes[i];
+  bool valid=validBenchPing(packet);
+  Serial.printf("RF_RX len=%u hex=%s valid=%d rssi=%.1f\n",
+    (unsigned)len,hex.c_str(),valid,lastRfRssi);
+  storeRf(String("RX len=")+String((unsigned)len)+" hex="+hex+" valid="+String(valid));
+  if(!valid) {
+    ++rfRejected;
+    storeRf("REJECT malformed");
+    recoverBenchReceiver("invalid_payload");
+    return;
+  }
+  uint32_t requestID=strtoul(packet.c_str()+10,nullptr,10);
+  if(seenBenchID(requestID)) ++rfDuplicates; else ++rfUnique;
+  String reply="BENCHACK:"+packet.substring(10);
+  radioPacketPending=false;
+  delay(120); // Preserve the current ACK timing for controlled comparison.
+  int tx=packetRadio.transmit(reply);
+  radioPacketPending=false;
+  if(tx==RADIOLIB_ERR_NONE) ++rfAck; else ++rfAckErrors;
+  storeRf(String("ACK ")+reply+" code="+String(tx));
+  Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
+  if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
+  int arm=packetRadio.startReceive();
+  if(arm!=RADIOLIB_ERR_NONE) {
+    ++rfRearmErrors;
+    recoverBenchReceiver("ack_rearm");
+  }
 }
 
 void resetMotion() {
