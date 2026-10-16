@@ -137,6 +137,7 @@ void storeRf(const String &event) {
   historyAt=(historyAt+1)%20;
   if(historyCount<20) ++historyCount;
 }
+bool regRead(uint8_t addr,uint8_t &out,bool status);
 void tcpReply(String cmd) {
   cmd.trim(); cmd.toLowerCase();
   if(cmd=="status") {
