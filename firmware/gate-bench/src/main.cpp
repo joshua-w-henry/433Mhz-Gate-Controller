@@ -46,63 +46,6 @@ bool linkOK=false;
 uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
 String lastPing="";
 float lastRfRssi=0;
-String rfHistory[20];
-uint8_t historyAt=0, historyCount=0;
-WiFiServer benchServer(2323);
-WiFiClient benchClient;
-String tcpCommand="";
-uint32_t wifiLastAttempt=0;
-void storeRf(const String &event) {
-  rfHistory[historyAt]=String(millis())+" "+event;
-  historyAt=(historyAt+1)%20;
-  if(historyCount<20) ++historyCount;
-}
-void tcpReply(String cmd) {
-  cmd.trim(); cmd.toLowerCase();
-  if(cmd=="status") {
-    benchClient.printf("state=%s angle=%.1f closed=%d sensor_fault=%d operation_fault=%s\n",
-      state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
-      closedSwitch.stable,sensorFault,operationFault.c_str());
-  } else if(cmd=="rf") {
-    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu rssi=%.1f irq=%lu\n",
-      (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
-      (unsigned long)rfRejected,lastRfRssi,(unsigned long)gateRxIrqs);
-  } else if(cmd=="logs") {
-    for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
-  } else if(cmd=="quit") benchClient.stop();
-  else benchClient.println("READ ONLY: status, rf, logs, help, quit");
-}
-void tickTcp() {
-#if GATE_WIFI_ENABLED
-  if(WiFi.status()!=WL_CONNECTED) {
-    if(millis()-wifiLastAttempt>=10000) { wifiLastAttempt=millis(); WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD); }
-    return;
-  }
-  if(!benchClient || !benchClient.connected()) {
-    benchClient.stop();
-    benchClient=benchServer.available();
-    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, logs, quit");
-  }
-  unsigned n=64;
-  while(benchClient && benchClient.available() && n--) {
-    char c=(char)benchClient.read();
-    if(c=='\n'||c=='\r') { if(tcpCommand.length()) { tcpReply(tcpCommand); tcpCommand=""; } }
-    else if(c>=32 && c<=126 && tcpCommand.length()<40) tcpCommand+=c;
-  }
-#endif
-}
-void beginBenchWifi() {
-#if GATE_WIFI_ENABLED
-  WiFi.mode(WIFI_STA);
-  WiFi.setHostname("rf-gate-bench");
-  WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD);
-  benchServer.begin();
-  Serial.println("GATE_TCP Wi-Fi enabled; read-only port 2323");
-#else
-  Serial.println("GATE_TCP disabled; add local src/wifi_secrets.h");
-#endif
-}
-
 bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
 int page=0, closedRaw=-1, openRaw=-1;
@@ -162,6 +105,63 @@ void latchOperationFault(const char *name, uint32_t now) {
   }
 }
 
+
+String rfHistory[20];
+uint8_t historyAt=0, historyCount=0;
+WiFiServer benchServer(2323);
+WiFiClient benchClient;
+String tcpCommand="";
+uint32_t wifiLastAttempt=0;
+void storeRf(const String &event) {
+  rfHistory[historyAt]=String(millis())+" "+event;
+  historyAt=(historyAt+1)%20;
+  if(historyCount<20) ++historyCount;
+}
+void tcpReply(String cmd) {
+  cmd.trim(); cmd.toLowerCase();
+  if(cmd=="status") {
+    benchClient.printf("state=%s angle=%.1f closed=%d sensor_fault=%d operation_fault=%s\n",
+      state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
+      closedSwitch.stable,sensorFault,operationFault.c_str());
+  } else if(cmd=="rf") {
+    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu rssi=%.1f irq=%lu\n",
+      (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
+      (unsigned long)rfRejected,lastRfRssi,(unsigned long)gateRxIrqs);
+  } else if(cmd=="logs") {
+    for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
+  } else if(cmd=="quit") benchClient.stop();
+  else benchClient.println("READ ONLY: status, rf, logs, help, quit");
+}
+void tickTcp() {
+#if GATE_WIFI_ENABLED
+  if(WiFi.status()!=WL_CONNECTED) {
+    if(millis()-wifiLastAttempt>=10000) { wifiLastAttempt=millis(); WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD); }
+    return;
+  }
+  if(!benchClient || !benchClient.connected()) {
+    benchClient.stop();
+    benchClient=benchServer.available();
+    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, logs, quit");
+  }
+  unsigned n=64;
+  while(benchClient && benchClient.available() && n--) {
+    char c=(char)benchClient.read();
+    if(c=='\n'||c=='\r') { if(tcpCommand.length()) { tcpReply(tcpCommand); tcpCommand=""; } }
+    else if(c>=32 && c<=126 && tcpCommand.length()<40) tcpCommand+=c;
+  }
+#endif
+}
+void beginBenchWifi() {
+#if GATE_WIFI_ENABLED
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("rf-gate-bench");
+  WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD);
+  benchServer.begin();
+  Serial.println("GATE_TCP Wi-Fi enabled; read-only port 2323");
+#else
+  Serial.println("GATE_TCP disabled; add local src/wifi_secrets.h");
+#endif
+}
 
 void message(const String &s) { notice=s; noticeAt=millis(); Serial.println(s); }
 void activateBench() {
