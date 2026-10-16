@@ -60,8 +60,18 @@ void printRfConfig() {
   Serial.println("RF_CONFIG_END");
 }
 uint32_t testTransactions=0, testSucceeded=0, testFailed=0, testRetries=0;
+uint32_t firstAttemptOK=0, retryOK=0, txErrors=0, rxArmErrors=0, crcErrors=0, invalidAcks=0, ackWaitTimeouts=0;
+uint32_t latencyTotal=0, latencyMax=0;
 uint16_t batchRemaining=0;
 uint32_t batchNextAt=0;
+void printTestStats() {
+  Serial.printf("RF_STATS requests=%lu success=%lu failed=%lu retries=%lu first_ok=%lu retry_ok=%lu tx_error=%lu rx_arm_error=%lu crc=%lu invalid_ack=%lu ack_timeout=%lu avg_ack_ms=%lu max_ack_ms=%lu remaining=%u\n",
+    (unsigned long)testTransactions,(unsigned long)testSucceeded,(unsigned long)testFailed,
+    (unsigned long)testRetries,(unsigned long)firstAttemptOK,(unsigned long)retryOK,
+    (unsigned long)txErrors,(unsigned long)rxArmErrors,(unsigned long)crcErrors,
+    (unsigned long)invalidAcks,(unsigned long)ackWaitTimeouts,
+    (unsigned long)(testSucceeded?latencyTotal/testSucceeded:0),(unsigned long)latencyMax,batchRemaining);
+}
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
   // Retries reuse the SAME packet identifier. This is bench connectivity only.
@@ -74,6 +84,7 @@ void sendBenchPing() {
     int sent=packetRadio.transmit(ping);
     if(sent!=RADIOLIB_ERR_NONE) {
       Serial.printf("RF_TX id=%lu attempt=%u code=%d\n",(unsigned long)benchPingSeq,attempt,sent);
+      ++txErrors;
       mobileRfDiagnostics("ping_tx_error");
       continue;
     }
@@ -82,6 +93,7 @@ void sendBenchPing() {
     int rxStart=packetRadio.startReceive();
     Serial.printf("RF_TX id=%lu attempt=%u code=%d rx_arm=%d\n",
       (unsigned long)benchPingSeq,attempt,sent,rxStart);
+    if(rxStart!=RADIOLIB_ERR_NONE) ++rxArmErrors;
     uint32_t started=millis();
     while(rxStart==RADIOLIB_ERR_NONE && millis()-started<1200 && !success) {
       if(mobileRxPending) {
@@ -92,22 +104,26 @@ void sendBenchPing() {
           Serial.printf("RF_REPLY id=%lu attempt=%u rssi=%.1f latency_ms=%lu\n",
             (unsigned long)benchPingSeq,attempt,packetRadio.getRSSI(),(unsigned long)(millis()-started));
           success=true;
+          if(attempt==1) ++firstAttemptOK; else ++retryOK;
+          uint32_t latency=millis()-started;
+          latencyTotal+=latency;
+          if(latency>latencyMax) latencyMax=latency;
         } else {
           Serial.printf("RF_REPLY_IGNORED id=%lu code=%d len=%u\n",
             (unsigned long)benchPingSeq,rc,(unsigned)reply.length());
+          if(rc==RADIOLIB_ERR_CRC_MISMATCH) ++crcErrors; else ++invalidAcks;
           if(!success) packetRadio.startReceive();
         }
       }
       delay(1);
     }
+    if(!success && rxStart==RADIOLIB_ERR_NONE) ++ackWaitTimeouts;
     packetRadio.standby();
     packetRadio.clearPacketReceivedAction();
   }
   if(success) ++testSucceeded;
   else { ++testFailed; Serial.printf("RF_TRANSACTION_FAILED id=%lu\n",(unsigned long)benchPingSeq); }
-  Serial.printf("RF_STATS requests=%lu success=%lu failed=%lu retries=%lu\n",
-    (unsigned long)testTransactions,(unsigned long)testSucceeded,
-    (unsigned long)testFailed,(unsigned long)testRetries);
+  printTestStats();
   wakeScreen();
   banner=success?"RF ACK OK":"RF NO ACK"; messageAt=millis();
 }
@@ -186,7 +202,7 @@ void loop() {
     char c=Serial.read();
     if(c=='t') { batchRemaining=100; batchNextAt=millis(); Serial.println("RF_BATCH begin count=100 (paced 2s between requests)"); }
     else if(c=='z') { batchRemaining=0; Serial.println("RF_BATCH cancelled"); }
-    else if(c=='v') Serial.printf("RF_STATS requests=%lu success=%lu failed=%lu retries=%lu remaining=%u\n",(unsigned long)testTransactions,(unsigned long)testSucceeded,(unsigned long)testFailed,(unsigned long)testRetries,batchRemaining);
+    else if(c=='v') printTestStats();
     else if(c=='d') printRfConfig();
     else if(c=='p') sendBenchPing();
     else if(c=='a') requestBench("ACTIVATE");
