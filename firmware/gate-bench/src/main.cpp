@@ -47,6 +47,8 @@ bool linkOK=false;
 uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
 uint32_t rfCrcErrors=0, rfAckErrors=0, rfRearmErrors=0;
 uint32_t rfEmpty=0, rfOversize=0, rfRecoveries=0, rfRxErrors=0;
+uint32_t rfSpurious=0, rfOverflow=0, rfDiscard=0;
+uint32_t lastBadFrameAt=0;
 int lastRadioBeginCode=0, lastRadioArmCode=0;
 uint32_t lastRadioRecoveryAt=0;
 constexpr size_t BENCH_MAX_PACKET=24;
@@ -148,10 +150,18 @@ void tcpReply(String cmd) {
       (unsigned long)rfEmpty,(unsigned long)rfOversize,(unsigned long)rfRxErrors,
       (unsigned long)rfRecoveries,(unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,
       lastRadioBeginCode,lastRadioArmCode,linkOK,lastRfRssi,(unsigned long)gateRxIrqs);
+  } else if(cmd=="diag") {
+    uint8_t marc=0,rxbytes=0,iocfg0=0,pktctrl0=0;
+    bool ok=regRead(0x35,marc,true) && regRead(0x3B,rxbytes,true)
+         && regRead(0x02,iocfg0) && regRead(0x08,pktctrl0);
+    benchClient.printf("spi=%d marc=0x%02X rxbytes=0x%02X fifo_count=%u overflow=%d gdo0=%d iocfg0=0x%02X pktctrl0=0x%02X irq=%lu spurious=%lu overflow_count=%lu discarded=%lu\n",
+      ok,marc,rxbytes,rxbytes&0x7F,(rxbytes&0x80)!=0,digitalRead(RF_GDO0_PIN),
+      iocfg0,pktctrl0,(unsigned long)gateRxIrqs,(unsigned long)rfSpurious,
+      (unsigned long)rfOverflow,(unsigned long)rfDiscard);
   } else if(cmd=="logs") {
     for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
   } else if(cmd=="quit") benchClient.stop();
-  else benchClient.println("READ ONLY: status, rf, logs, help, quit");
+  else benchClient.println("READ ONLY: status, rf, diag, logs, help, quit");
 }
 void beginGateOTA() {
 #if GATE_WIFI_ENABLED && defined(GATE_OTA_PASSWORD)
@@ -191,7 +201,7 @@ void tickTcp() {
   if(!benchClient || !benchClient.connected()) {
     benchClient.stop();
     benchClient=benchServer.available();
-    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, logs, quit");
+    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, diag, logs, quit");
   }
   unsigned n=64;
   while(benchClient && benchClient.available() && n--) {
@@ -339,6 +349,21 @@ void recoverBenchReceiver(const char *reason) {
   storeRf(String("RECOVERY ")+reason+" begin="+String(lastRadioBeginCode)+
           " arm="+String(lastRadioArmCode));
 }
+void rearmAfterBadFrame(const char *reason) {
+  // Do not reinitialize the entire radio in a tight IRQ-driven loop.
+  // CC1101 finishReceive() flushes the FIFO and restores GDO0 to high-Z.
+  radioPacketPending=false;
+  packetRadio.clearPacketReceivedAction();
+  int cleanup=packetRadio.finishReceive();
+  packetRadio.setPacketReceivedAction(onRadioPacket);
+  int arm=packetRadio.startReceive();
+  lastRadioArmCode=arm;
+  linkOK=(arm==RADIOLIB_ERR_NONE);
+  ++rfDiscard;
+  if(!linkOK) ++rfRearmErrors;
+  lastBadFrameAt=millis();
+  storeRf(String("DISCARD ")+reason+" cleanup="+String(cleanup)+" arm="+String(arm));
+}
 void tickBenchLink() {
   if(!linkOK) {
     if(millis()-lastRadioRecoveryAt>=10000) {
@@ -348,6 +373,18 @@ void tickBenchLink() {
   }
   if(!radioPacketPending) return;
   radioPacketPending=false;
+  // GDO0 can signal FIFO threshold or a spurious edge. Check FIFO state
+  // before consuming its first byte as a variable-length header.
+  uint8_t rxbytes=0,marc=0;
+  bool fifoOK=regRead(0x3B,rxbytes,true) && regRead(0x35,marc,true);
+  if(!fifoOK) { ++rfRxErrors; rearmAfterBadFrame("spi_status_error"); return; }
+  if(rxbytes&0x80) { ++rfOverflow; rearmAfterBadFrame("fifo_overflow"); return; }
+  if((rxbytes&0x7F)<4) {
+    ++rfSpurious;
+    // Empty FIFO: ignore edge and keep receiver armed. Avoid an
+    // immediate radio reset, especially if GPIO26 wiring is noisy.
+    return;
+  }
   // CC1101 getPacketLength() consumes the length byte; call it exactly
   // once before readData() and reject all oversized frames.
   size_t len=packetRadio.getPacketLength();
@@ -356,7 +393,7 @@ void tickBenchLink() {
     if(!len) ++rfEmpty; else ++rfOversize;
     Serial.printf("RF_RX_BAD_LENGTH len=%u\n",(unsigned)len);
     storeRf(String("BAD_LENGTH ")+String((unsigned)len));
-    recoverBenchReceiver("bad_length");
+    rearmAfterBadFrame("bad_length");
     return;
   }
   uint8_t bytes[BENCH_MAX_PACKET+1]={0};
@@ -366,7 +403,7 @@ void tickBenchLink() {
     if(rc==RADIOLIB_ERR_CRC_MISMATCH) ++rfCrcErrors;
     Serial.printf("RF_RX_ERROR code=%d len=%u\n",rc,(unsigned)len);
     storeRf(String("RX_ERROR ")+String(rc)+" len="+String((unsigned)len));
-    recoverBenchReceiver("read_error");
+    rearmAfterBadFrame("read_error");
     return;
   }
   ++rfRx;
@@ -386,7 +423,7 @@ void tickBenchLink() {
   if(!valid) {
     ++rfRejected;
     storeRf("REJECT malformed");
-    recoverBenchReceiver("invalid_payload");
+    rearmAfterBadFrame("invalid_payload");
     return;
   }
   uint32_t requestID=strtoul(packet.c_str()+10,nullptr,10);
@@ -401,6 +438,7 @@ void tickBenchLink() {
   Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
   if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
   int arm=packetRadio.startReceive();
+  lastRadioArmCode=arm;
   if(arm!=RADIOLIB_ERR_NONE) {
     ++rfRearmErrors;
     recoverBenchReceiver("ack_rearm");
