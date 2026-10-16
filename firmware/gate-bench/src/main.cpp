@@ -137,7 +137,7 @@ void storeRf(const String &event) {
   historyAt=(historyAt+1)%20;
   if(historyCount<20) ++historyCount;
 }
-bool regRead(uint8_t addr,uint8_t &out,bool status);
+bool regRead(uint8_t addr,uint8_t &out,bool status=false);
 void tcpReply(String cmd) {
   cmd.trim(); cmd.toLowerCase();
   if(cmd=="status") {
@@ -256,7 +256,7 @@ bool readyRadio() {
   while(digitalRead(MISO_PIN)==HIGH) if(micros()-t>20000) return false;
   return true;
 }
-bool regRead(uint8_t addr,uint8_t &out,bool status=false) {
+bool regRead(uint8_t addr,uint8_t &out,bool status) {
   SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
   digitalWrite(CS,LOW);
   bool ok=readyRadio();
@@ -355,7 +355,7 @@ void rearmAfterBadFrame(const char *reason) {
   // CC1101 finishReceive() flushes the FIFO and restores GDO0 to high-Z.
   radioPacketPending=false;
   packetRadio.clearPacketReceivedAction();
-  int cleanup=packetRadio.finishReceive();
+  int cleanup=packetRadio.standby();
   packetRadio.setPacketReceivedAction(onRadioPacket);
   int arm=packetRadio.startReceive();
   lastRadioArmCode=arm;
