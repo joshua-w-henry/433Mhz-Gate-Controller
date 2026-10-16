@@ -59,43 +59,58 @@ void printRfConfig() {
   }
   Serial.println("RF_CONFIG_END");
 }
+uint32_t testTransactions=0, testSucceeded=0, testFailed=0, testRetries=0;
+uint16_t batchRemaining=0;
+uint32_t batchNextAt=0;
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
+  // Retries reuse the SAME packet identifier. This is bench connectivity only.
   String ping="BENCHPING:"+String(++benchPingSeq);
-  uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
-  int sent=packetRadio.transmit(ping);
-  if(sent==RADIOLIB_ERR_NONE) {
+  bool success=false;
+  ++testTransactions;
+  for(uint8_t attempt=1;attempt<=3 && !success;attempt++) {
+    if(attempt>1) { ++testRetries; delay(250); }
     mobileRxPending=false;
+    int sent=packetRadio.transmit(ping);
+    if(sent!=RADIOLIB_ERR_NONE) {
+      Serial.printf("RF_TX id=%lu attempt=%u code=%d\n",(unsigned long)benchPingSeq,attempt,sent);
+      mobileRfDiagnostics("ping_tx_error");
+      continue;
+    }
     packetRadio.setPacketReceivedAction(onMobileRadioPacket);
+    mobileRxPending=false;
     int rxStart=packetRadio.startReceive();
-    logGdo2Monitor("mobile_ping",edgeBefore,highBefore);
-    Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent);
-    Serial.printf("RF_RX_ARM code=%d GDO0=%d\n",rxStart,digitalRead(RF_GDO0_PIN));
-    bool gotReply=false;
-    uint32_t waitStart=millis();
-    while(rxStart==RADIOLIB_ERR_NONE && millis()-waitStart<1200) {
+    Serial.printf("RF_TX id=%lu attempt=%u code=%d rx_arm=%d\n",
+      (unsigned long)benchPingSeq,attempt,sent,rxStart);
+    uint32_t started=millis();
+    while(rxStart==RADIOLIB_ERR_NONE && millis()-started<1200 && !success) {
       if(mobileRxPending) {
         mobileRxPending=false;
         String reply;
-        int rx=packetRadio.readData(reply);
-        if(rx==RADIOLIB_ERR_NONE && reply=="BENCHACK:"+String(benchPingSeq)) {
-          Serial.printf("RF_REPLY payload=%s rssi=%.1f\n",reply.c_str(),packetRadio.getRSSI());
-          gotReply=true;
-          break;
+        int rc=packetRadio.readData(reply);
+        if(rc==RADIOLIB_ERR_NONE && reply=="BENCHACK:"+String(benchPingSeq)) {
+          Serial.printf("RF_REPLY id=%lu attempt=%u rssi=%.1f latency_ms=%lu\n",
+            (unsigned long)benchPingSeq,attempt,packetRadio.getRSSI(),(unsigned long)(millis()-started));
+          success=true;
+        } else {
+          Serial.printf("RF_REPLY_IGNORED id=%lu code=%d len=%u\n",
+            (unsigned long)benchPingSeq,rc,(unsigned)reply.length());
+          if(!success) packetRadio.startReceive();
         }
-        Serial.printf("RF_REPLY_IGNORED code=%d len=%u\n",rx,(unsigned)reply.length());
-        packetRadio.startReceive();
       }
       delay(1);
     }
     packetRadio.standby();
     packetRadio.clearPacketReceivedAction();
-    if(!gotReply) { Serial.println("RF_REPLY_TIMEOUT"); mobileRfDiagnostics("mobile_reply_rx_error"); }
-  } else { logGdo2Monitor("mobile_ping",edgeBefore,highBefore); Serial.printf("RF_TX payload=%s code=%d\n",ping.c_str(),sent); mobileRfDiagnostics("mobile_ping_tx_error"); }
+  }
+  if(success) ++testSucceeded;
+  else { ++testFailed; Serial.printf("RF_TRANSACTION_FAILED id=%lu\n",(unsigned long)benchPingSeq); }
+  Serial.printf("RF_STATS requests=%lu success=%lu failed=%lu retries=%lu\n",
+    (unsigned long)testTransactions,(unsigned long)testSucceeded,
+    (unsigned long)testFailed,(unsigned long)testRetries);
   wakeScreen();
-  banner="RF PING TEST"; messageAt=millis();
+  banner=success?"RF ACK OK":"RF NO ACK"; messageAt=millis();
 }
-
 
 void wakeScreen() {
   lastInteraction=millis();
@@ -169,7 +184,10 @@ void loop() {
   else if(a) requestBench("ACTIVATE");
   while(Serial.available()) {
     char c=Serial.read();
-    if(c=='d') printRfConfig();
+    if(c=='t') { batchRemaining=100; batchNextAt=millis(); Serial.println("RF_BATCH begin count=100 (paced 2s between requests)"); }
+    else if(c=='z') { batchRemaining=0; Serial.println("RF_BATCH cancelled"); }
+    else if(c=='v') Serial.printf("RF_STATS requests=%lu success=%lu failed=%lu retries=%lu remaining=%u\n",(unsigned long)testTransactions,(unsigned long)testSucceeded,(unsigned long)testFailed,(unsigned long)testRetries,batchRemaining);
+    else if(c=='d') printRfConfig();
     else if(c=='p') sendBenchPing();
     else if(c=='a') requestBench("ACTIVATE");
     else if(c=='s') { page=(page+1)%2; requestBench("STATUS"); }
@@ -177,6 +195,12 @@ void loop() {
     else if(c=='h') Serial.println("a=ACT test; s=STATUS test/page; r=radio probe. BENCH ONLY: no packets.");
   }
   now=millis();
+  if(batchRemaining && (int32_t)(now-batchNextAt)>=0) {
+    --batchRemaining;
+    sendBenchPing();
+    batchNextAt=millis()+2000;
+    if(!batchRemaining) Serial.println("RF_BATCH completed");
+  }
   if(screenOn && now-lastInteraction>=SCREEN_IDLE_MS) {
     if(displayOK) oled.ssd1306_command(SSD1306_DISPLAYOFF);
     screenOn=false;
