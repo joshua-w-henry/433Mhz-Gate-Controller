@@ -47,6 +47,8 @@ bool linkOK=false;
 uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
 uint32_t rfCrcErrors=0, rfAckErrors=0, rfRearmErrors=0;
 uint32_t rfEmpty=0, rfOversize=0, rfRecoveries=0, rfRxErrors=0;
+int lastRadioBeginCode=0, lastRadioArmCode=0;
+uint32_t lastRadioRecoveryAt=0;
 constexpr size_t BENCH_MAX_PACKET=24;
 uint32_t rfUnique=0;
 String lastPing="";
@@ -140,11 +142,12 @@ void tcpReply(String cmd) {
       state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
       closedSwitch.stable,sensorFault,operationFault.c_str());
   } else if(cmd=="rf") {
-    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu unique=%lu crc=%lu empty=%lu oversize=%lu rx_error=%lu recoveries=%lu ack_error=%lu rearm_error=%lu rssi=%.1f irq=%lu\n",
+    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu unique=%lu crc=%lu empty=%lu oversize=%lu rx_error=%lu recoveries=%lu ack_error=%lu rearm_error=%lu begin_code=%d arm_code=%d link_ok=%d rssi=%.1f irq=%lu\n",
       (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
       (unsigned long)rfRejected,(unsigned long)rfUnique,(unsigned long)rfCrcErrors,
       (unsigned long)rfEmpty,(unsigned long)rfOversize,(unsigned long)rfRxErrors,
-      (unsigned long)rfRecoveries,(unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,lastRfRssi,(unsigned long)gateRxIrqs);
+      (unsigned long)rfRecoveries,(unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,
+      lastRadioBeginCode,lastRadioArmCode,linkOK,lastRfRssi,(unsigned long)gateRxIrqs);
   } else if(cmd=="logs") {
     for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
   } else if(cmd=="quit") benchClient.stop();
@@ -304,6 +307,9 @@ void startBenchLink() {
     rc=packetRadio.startReceive();
   }
   linkOK=(rc==RADIOLIB_ERR_NONE);
+  lastRadioBeginCode=rc;
+  lastRadioArmCode=rc;
+  lastRadioRecoveryAt=millis();
   beginGdo2Monitor();
   Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
 }
@@ -316,19 +322,26 @@ void benchRxStatus(const char* context) {
 }
 void recoverBenchReceiver(const char *reason) {
   ++rfRecoveries;
+  lastRadioRecoveryAt=millis();
   radioPacketPending=false;
-  int stop=packetRadio.standby();
-  int arm=packetRadio.startReceive();
-  if(arm!=RADIOLIB_ERR_NONE) ++rfRearmErrors;
-  Serial.printf("RF_RECOVERY reason=%s standby=%d rearm=%d\n",reason,stop,arm);
-  storeRf(String("RECOVERY ")+reason+" stop="+String(stop)+" arm="+String(arm));
-  linkOK=(arm==RADIOLIB_ERR_NONE);
+  // A plain startReceive() is insufficient after failed initialization.
+  // Reinitialize the CC1101 using the same configuration as startup.
+  packetRadio.clearPacketReceivedAction();
+  lastRadioBeginCode=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(lastRadioBeginCode==RADIOLIB_ERR_NONE) {
+    packetRadio.setPacketReceivedAction(onRadioPacket);
+    lastRadioArmCode=packetRadio.startReceive();
+  } else lastRadioArmCode=lastRadioBeginCode;
+  linkOK=(lastRadioArmCode==RADIOLIB_ERR_NONE);
+  if(!linkOK) ++rfRearmErrors;
+  Serial.printf("RF_RECOVERY reason=%s begin=%d arm=%d ok=%d\n",
+    reason,lastRadioBeginCode,lastRadioArmCode,linkOK);
+  storeRf(String("RECOVERY ")+reason+" begin="+String(lastRadioBeginCode)+
+          " arm="+String(lastRadioArmCode));
 }
 void tickBenchLink() {
   if(!linkOK) {
-    static uint32_t lastTry=0;
-    if(millis()-lastTry>=2000) {
-      lastTry=millis();
+    if(millis()-lastRadioRecoveryAt>=10000) {
       recoverBenchReceiver("periodic_rearm");
     }
     return;
