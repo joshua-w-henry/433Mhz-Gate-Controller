@@ -6,6 +6,14 @@
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
 #include <RadioLib.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#define GATE_WIFI_ENABLED 1
+#else
+#define GATE_WIFI_ENABLED 0
+#endif
 #include "../../shared/radio_pins.h"
 
 // BENCH ONLY: no relay drive, no wireless commands, no Wi-Fi credentials.
@@ -35,7 +43,66 @@ volatile bool radioPacketPending=false;
 volatile uint32_t gateRxIrqs=0;
 void IRAM_ATTR onRadioPacket() { radioPacketPending=true; ++gateRxIrqs; }
 bool linkOK=false;
-uint32_t rfRx=0, rfAck=0;
+uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
+String lastPing="";
+float lastRfRssi=0;
+String rfHistory[20];
+uint8_t historyAt=0, historyCount=0;
+WiFiServer benchServer(2323);
+WiFiClient benchClient;
+String tcpCommand="";
+uint32_t wifiLastAttempt=0;
+void storeRf(const String &event) {
+  rfHistory[historyAt]=String(millis())+" "+event;
+  historyAt=(historyAt+1)%20;
+  if(historyCount<20) ++historyCount;
+}
+void tcpReply(String cmd) {
+  cmd.trim(); cmd.toLowerCase();
+  if(cmd=="status") {
+    benchClient.printf("state=%s angle=%.1f closed=%d sensor_fault=%d operation_fault=%s\n",
+      state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
+      closedSwitch.stable,sensorFault,operationFault.c_str());
+  } else if(cmd=="rf") {
+    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu rssi=%.1f irq=%lu\n",
+      (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
+      (unsigned long)rfRejected,lastRfRssi,(unsigned long)gateRxIrqs);
+  } else if(cmd=="logs") {
+    for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
+  } else if(cmd=="quit") benchClient.stop();
+  else benchClient.println("READ ONLY: status, rf, logs, help, quit");
+}
+void tickTcp() {
+#if GATE_WIFI_ENABLED
+  if(WiFi.status()!=WL_CONNECTED) {
+    if(millis()-wifiLastAttempt>=10000) { wifiLastAttempt=millis(); WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD); }
+    return;
+  }
+  if(!benchClient || !benchClient.connected()) {
+    benchClient.stop();
+    benchClient=benchServer.available();
+    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, logs, quit");
+  }
+  unsigned n=64;
+  while(benchClient && benchClient.available() && n--) {
+    char c=(char)benchClient.read();
+    if(c=='\n'||c=='\r') { if(tcpCommand.length()) { tcpReply(tcpCommand); tcpCommand=""; } }
+    else if(c>=32 && c<=126 && tcpCommand.length()<40) tcpCommand+=c;
+  }
+#endif
+}
+void beginBenchWifi() {
+#if GATE_WIFI_ENABLED
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("rf-gate-bench");
+  WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD);
+  benchServer.begin();
+  Serial.println("GATE_TCP Wi-Fi enabled; read-only port 2323");
+#else
+  Serial.println("GATE_TCP disabled; add local src/wifi_secrets.h");
+#endif
+}
+
 bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
 int page=0, closedRaw=-1, openRaw=-1;
@@ -207,10 +274,13 @@ void tickBenchLink() {
   int rc=packetRadio.readData(packet);
   if(rc==RADIOLIB_ERR_NONE) {
     ++rfRx;
+    lastRfRssi=packetRadio.getRSSI(); storeRf(String("RX ")+packet);
     Serial.printf("RF_RX payload=%s rssi=%.1f count=%lu\n",
       packet.c_str(),packetRadio.getRSSI(),(unsigned long)rfRx);
     // BENCHPING is deliberately not an actuation request and has no authority.
     if(validBenchPing(packet)) {
+      if(packet==lastPing) ++rfDuplicates;
+      lastPing=packet;
       String reply="BENCHACK:"+packet.substring(10);
       uint32_t edgeBefore=gdo2Edges, highBefore=gdo2HighEdges;
       radioPacketPending=false; // RX GDO0 can also toggle during a TX transition
@@ -219,9 +289,10 @@ void tickBenchLink() {
       logGdo2Monitor("gate_ack",edgeBefore,highBefore);
       radioPacketPending=false;
       if(tx==RADIOLIB_ERR_NONE) ++rfAck;
+      storeRf(String("ACK ")+reply+" code="+String(tx));
       Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
       if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
-    } else Serial.println("RF_RX_IGNORED malformed bench packet");
+    } else { ++rfRejected; storeRf("REJECT malformed"); Serial.println("RF_RX_IGNORED malformed bench packet"); }
   } else Serial.printf("RF_RX_ERROR code=%d\n",rc);
   int rr=packetRadio.startReceive();
   if(rr!=RADIOLIB_ERR_NONE) Serial.printf("RF_REARM_ERROR code=%d\n",rr);
@@ -509,11 +580,11 @@ void setup() {
   prefs.begin("gate-angle",false); closedRaw=prefs.getInt("closed",-1); openRaw=prefs.getInt("open",-1);
   Serial.println("\nMM571 GateNode Bench v1 - NO RELAY OUTPUT / NO RF COMMANDS");
   Serial.printf("OLED %s address=0x%02X\n",displayOK?"OK":"NOT FOUND",oledAddr);
-  probeRadio(); startBenchLink(); command('h');
+  probeRadio(); startBenchLink(); beginBenchWifi(); command('h');
 }
 void loop() {
   uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now); tickBenchLink();
   while(Serial.available()) command(Serial.read());
   if(now-lastReport>=2000) { lastReport=now; printStatus(); }
-  draw(now); delay(1);
+  tickTcp(); draw(now); delay(1);
 }
