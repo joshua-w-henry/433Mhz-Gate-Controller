@@ -7,3 +7,7 @@ constexpr int RF_SCK_PIN = 18;
 constexpr int RF_MOSI_PIN = 23;
 constexpr int RF_MISO_PIN = 19;
 constexpr float RF_FREQUENCY_MHZ = 433.92f;
+
+// Experimental field profile: identical 2.4 kbps on both ends.
+// Preserve RadioLib's existing receive bandwidth, deviation, and power.
+constexpr float RF_BIT_RATE_KBPS = 2.4f;
