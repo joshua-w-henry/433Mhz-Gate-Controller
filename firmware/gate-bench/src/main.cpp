@@ -8,6 +8,7 @@
 #include <RadioLib.h>
 #include <WiFi.h>
 #include <WiFiServer.h>
+#include <ArduinoOTA.h>
 #if __has_include("wifi_secrets.h")
 #include "wifi_secrets.h"
 #define GATE_WIFI_ENABLED 1
@@ -123,6 +124,7 @@ WiFiServer benchServer(2323);
 WiFiClient benchClient;
 String tcpCommand="";
 uint32_t wifiLastAttempt=0;
+bool otaReady=false, otaBusy=false;
 bool wifiWasConnected=false;
 void storeRf(const String &event) {
   rfHistory[historyAt]=String(millis())+" "+event;
@@ -145,6 +147,27 @@ void tcpReply(String cmd) {
   } else if(cmd=="quit") benchClient.stop();
   else benchClient.println("READ ONLY: status, rf, logs, help, quit");
 }
+void beginGateOTA() {
+#if GATE_WIFI_ENABLED && defined(GATE_OTA_PASSWORD)
+  ArduinoOTA.setHostname("rf-gate-bench");
+  ArduinoOTA.setPassword(GATE_OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    otaBusy=true;
+    benchClient.stop();
+    Serial.println("OTA_BEGIN: gate actuation remains disabled");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA_COMPLETE"); });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaBusy=false;
+    Serial.printf("OTA_ERROR code=%u\n",(unsigned)error);
+  });
+  ArduinoOTA.begin();
+  otaReady=true;
+  Serial.println("GATE_OTA READY hostname=rf-gate-bench port=3232");
+#else
+  Serial.println("GATE_OTA DISABLED: set GATE_OTA_PASSWORD locally");
+#endif
+}
 void tickTcp() {
 #if GATE_WIFI_ENABLED
   if(WiFi.status()!=WL_CONNECTED) {
@@ -152,7 +175,13 @@ void tickTcp() {
     if(millis()-wifiLastAttempt>=10000) { wifiLastAttempt=millis(); WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD); }
     return;
   }
-  if(!wifiWasConnected) { wifiWasConnected=true; Serial.printf("GATE_TCP_CONNECTED ip=%s port=2323\n",WiFi.localIP().toString().c_str()); }
+  if(!wifiWasConnected) {
+    wifiWasConnected=true;
+    Serial.printf("GATE_TCP_CONNECTED ip=%s port=2323\n",WiFi.localIP().toString().c_str());
+    if(!otaReady) beginGateOTA();
+  }
+  if(otaReady) ArduinoOTA.handle();
+  if(otaBusy) return;
   if(!benchClient || !benchClient.connected()) {
     benchClient.stop();
     benchClient=benchServer.available();
@@ -602,8 +631,10 @@ void setup() {
   probeRadio(); startBenchLink(); beginBenchWifi(); command('h');
 }
 void loop() {
+  tickTcp();
+  if(otaBusy) { delay(1); return; }
   uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now); tickBenchLink();
   while(Serial.available()) command(Serial.read());
   if(now-lastReport>=2000) { lastReport=now; printStatus(); }
-  tickTcp(); draw(now); delay(1);
+  draw(now); delay(1);
 }
