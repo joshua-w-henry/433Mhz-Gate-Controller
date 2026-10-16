@@ -325,7 +325,15 @@ void recoverBenchReceiver(const char *reason) {
   linkOK=(arm==RADIOLIB_ERR_NONE);
 }
 void tickBenchLink() {
-  if(!linkOK || !radioPacketPending) return;
+  if(!linkOK) {
+    static uint32_t lastTry=0;
+    if(millis()-lastTry>=2000) {
+      lastTry=millis();
+      recoverBenchReceiver("periodic_rearm");
+    }
+    return;
+  }
+  if(!radioPacketPending) return;
   radioPacketPending=false;
   // CC1101 getPacketLength() consumes the length byte; call it exactly
   // once before readData() and reject all oversized frames.
