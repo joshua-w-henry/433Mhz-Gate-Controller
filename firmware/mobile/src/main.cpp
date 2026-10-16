@@ -183,6 +183,7 @@ void setup() {
   Serial.printf("OLED %s address=0x%02X\n",displayOK?"OK":"NOT FOUND",oledAddr);
   probeRadio();
   int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(rc==RADIOLIB_ERR_NONE) rc=packetRadio.setBitRate(RF_BIT_RATE_KBPS);
   linkOK=(rc==RADIOLIB_ERR_NONE);
   beginGdo2Monitor();
   Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
