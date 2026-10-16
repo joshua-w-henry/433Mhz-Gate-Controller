@@ -313,6 +313,7 @@ void printRfConfig() {
 void startBenchLink() {
   // SPI-only probe remains independent. No actuation commands are ever processed.
   int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(rc==RADIOLIB_ERR_NONE) rc=packetRadio.setBitRate(RF_BIT_RATE_KBPS);
   if(rc==RADIOLIB_ERR_NONE) {
     packetRadio.setPacketReceivedAction(onRadioPacket);
     rc=packetRadio.startReceive();
@@ -339,6 +340,8 @@ void recoverBenchReceiver(const char *reason) {
   // Reinitialize the CC1101 using the same configuration as startup.
   packetRadio.clearPacketReceivedAction();
   lastRadioBeginCode=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(lastRadioBeginCode==RADIOLIB_ERR_NONE)
+    lastRadioBeginCode=packetRadio.setBitRate(RF_BIT_RATE_KBPS);
   if(lastRadioBeginCode==RADIOLIB_ERR_NONE) {
     packetRadio.setPacketReceivedAction(onRadioPacket);
     lastRadioArmCode=packetRadio.startReceive();
