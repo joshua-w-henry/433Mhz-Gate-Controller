@@ -127,6 +127,11 @@ void latchOperationFault(const char *name, uint32_t now) {
 String rfHistory[20];
 uint8_t historyAt=0, historyCount=0;
 WiFiServer benchServer(2323);
+WiFiServer commandBenchServer(2324);
+WiFiClient commandBenchClient;
+String commandBenchLine="";
+uint32_t ipBenchRx=0, ipBenchAck=0, ipBenchReject=0;
+uint32_t commandBenchAt=0;
 WiFiClient benchClient;
 String tcpCommand="";
 uint32_t wifiLastAttempt=0;
@@ -138,6 +143,7 @@ void storeRf(const String &event) {
   if(historyCount<20) ++historyCount;
 }
 bool regRead(uint8_t addr,uint8_t &out,bool status=false);
+bool validBenchPing(const String &s);
 void tcpReply(String cmd) {
   cmd.trim(); cmd.toLowerCase();
   if(cmd=="status") {
@@ -151,6 +157,8 @@ void tcpReply(String cmd) {
       (unsigned long)rfEmpty,(unsigned long)rfOversize,(unsigned long)rfRxErrors,
       (unsigned long)rfRecoveries,(unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,
       lastRadioBeginCode,lastRadioArmCode,linkOK,lastRfRssi,(unsigned long)gateRxIrqs);
+  } else if(cmd=="ip") {
+    benchClient.printf("ip_rx=%lu ip_ack=%lu ip_reject=%lu port=2324 actuation=DISABLED\n",(unsigned long)ipBenchRx,(unsigned long)ipBenchAck,(unsigned long)ipBenchReject);
   } else if(cmd=="diag") {
     uint8_t marc=0,rxbytes=0,iocfg0=0,pktctrl0=0;
     bool ok=regRead(0x35,marc,true) && regRead(0x3B,rxbytes,true)
@@ -171,6 +179,7 @@ void beginGateOTA() {
   ArduinoOTA.onStart([]() {
     otaBusy=true;
     benchClient.stop();
+    commandBenchClient.stop();
     Serial.println("OTA_BEGIN: gate actuation remains disabled");
   });
   ArduinoOTA.onEnd([]() { Serial.println("OTA_COMPLETE"); });
@@ -199,10 +208,45 @@ void tickTcp() {
   }
   if(otaReady) ArduinoOTA.handle();
   if(otaBusy) return;
+  // Separate BENCH-ONLY transport. Never reaches the actuator or service-button code.
+  if(!commandBenchClient || !commandBenchClient.connected()) {
+    commandBenchClient.stop();
+    commandBenchLine="";
+    commandBenchClient=commandBenchServer.available();
+    commandBenchAt=millis();
+    if(commandBenchClient) commandBenchClient.setTimeout(50);
+  }
+  if(commandBenchClient && commandBenchClient.connected()) {
+    unsigned budget=64;
+    while(commandBenchClient.available() && budget--) {
+      char c=(char)commandBenchClient.read();
+      commandBenchAt=millis();
+      if(c=='\n' || c=='\r') {
+        if(commandBenchLine.length()) {
+          if(validBenchPing(commandBenchLine)) {
+            ++ipBenchRx;
+            // Bench ACK means the request was parsed; no gate command is executed.
+            commandBenchClient.print("BENCHACK:"+commandBenchLine.substring(10)+"\n");
+            ++ipBenchAck;
+          } else {
+            ++ipBenchReject;
+            commandBenchClient.print("ERR:BENCH_ONLY\n");
+          }
+          commandBenchLine="";
+          commandBenchClient.stop();
+          break;
+        }
+      } else if(c>=32 && c<=126 && commandBenchLine.length()<24) commandBenchLine+=c;
+      else { ++ipBenchReject; commandBenchClient.stop(); commandBenchLine=""; break; }
+    }
+    if(commandBenchClient.connected() && millis()-commandBenchAt>2000) {
+      commandBenchClient.stop(); commandBenchLine="";
+    }
+  }
   if(!benchClient || !benchClient.connected()) {
     benchClient.stop();
     benchClient=benchServer.available();
-    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, diag, logs, quit");
+    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, ip, diag, logs, quit");
   }
   unsigned n=64;
   while(benchClient && benchClient.available() && n--) {
@@ -218,7 +262,8 @@ void beginBenchWifi() {
   WiFi.setHostname("rf-gate-bench");
   WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD);
   benchServer.begin();
-  Serial.println("GATE_TCP Wi-Fi enabled; read-only port 2323");
+  commandBenchServer.begin();
+  Serial.println("GATE_TCP Wi-Fi enabled; diagnostics 2323 and BENCHPING-only 2324");
 #else
   Serial.println("GATE_TCP disabled; add local src/wifi_secrets.h");
 #endif
