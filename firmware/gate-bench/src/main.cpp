@@ -5,12 +5,65 @@
 #include <Preferences.h>
 #include <Adafruit_GFX.h>
 #include <Adafruit_SSD1306.h>
+#include <RadioLib.h>
+#include <WiFi.h>
+#include <WiFiServer.h>
+#include <ArduinoOTA.h>
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#define GATE_WIFI_ENABLED 1
+#else
+#define GATE_WIFI_ENABLED 0
+#endif
+#include "../../shared/radio_pins.h"
 
 // BENCH ONLY: no relay drive, no wireless commands, no Wi-Fi credentials.
 constexpr int CS=27, MISO_PIN=19, CLOSED_PIN=32, BUTTON_PIN=13, POT_PIN=34;
 constexpr float TRAVEL_DEG=90.0f; // Display scale only; change for actual hinge travel.
 Adafruit_SSD1306 oled(128,64,&Wire,-1);
 Preferences prefs;
+CC1101 packetRadio = new Module(RF_CS_PIN,RF_GDO0_PIN,RADIOLIB_NC,RF_GDO2_PIN);
+volatile uint32_t gdo2Edges=0, gdo2HighEdges=0;
+void IRAM_ATTR gdo2EdgeMonitor() {
+  ++gdo2Edges;
+  if(digitalRead(RF_GDO2_PIN)) ++gdo2HighEdges;
+}
+void beginGdo2Monitor() {
+  pinMode(RF_GDO2_PIN,INPUT);
+  attachInterrupt(digitalPinToInterrupt(RF_GDO2_PIN),gdo2EdgeMonitor,CHANGE);
+}
+void logGdo2Monitor(const char *site, uint32_t beforeEdges, uint32_t beforeHigh) {
+  noInterrupts();
+  uint32_t edges=gdo2Edges, high=gdo2HighEdges;
+  interrupts();
+  Serial.printf("RF_GDO2_TRACE site=%s edges=%lu rising=%lu level=%d\n",
+    site,(unsigned long)(edges-beforeEdges),(unsigned long)(high-beforeHigh),digitalRead(RF_GDO2_PIN));
+}
+
+volatile bool radioPacketPending=false;
+volatile uint32_t gateRxIrqs=0;
+void IRAM_ATTR onRadioPacket() { radioPacketPending=true; ++gateRxIrqs; }
+bool linkOK=false;
+uint32_t rfRx=0, rfAck=0, rfDuplicates=0, rfRejected=0;
+uint32_t rfCrcErrors=0, rfAckErrors=0, rfRearmErrors=0;
+uint32_t rfEmpty=0, rfOversize=0, rfRecoveries=0, rfRxErrors=0;
+uint32_t rfSpurious=0, rfOverflow=0, rfDiscard=0;
+uint32_t lastBadFrameAt=0;
+int lastRadioBeginCode=0, lastRadioArmCode=0;
+uint32_t lastRadioRecoveryAt=0;
+constexpr size_t BENCH_MAX_PACKET=24;
+uint32_t rfUnique=0;
+String lastPing="";
+uint32_t seenIDs[64]={};
+uint8_t seenCount=0, seenNext=0;
+bool seenBenchID(uint32_t id) {
+  for(uint8_t i=0;i<seenCount;i++) if(seenIDs[i]==id) return true;
+  seenIDs[seenNext]=id;
+  seenNext=(seenNext+1)%64;
+  if(seenCount<64) ++seenCount;
+  return false;
+}
+float lastRfRssi=0;
 bool displayOK=false, radioOK=false;
 uint8_t radioPart=255, radioVersion=255, oledAddr=0;
 int page=0, closedRaw=-1, openRaw=-1;
@@ -71,6 +124,151 @@ void latchOperationFault(const char *name, uint32_t now) {
 }
 
 
+String rfHistory[20];
+uint8_t historyAt=0, historyCount=0;
+WiFiServer benchServer(2323);
+WiFiServer commandBenchServer(2324);
+WiFiClient commandBenchClient;
+String commandBenchLine="";
+uint32_t ipBenchRx=0, ipBenchAck=0, ipBenchReject=0;
+uint32_t commandBenchAt=0;
+WiFiClient benchClient;
+String tcpCommand="";
+uint32_t wifiLastAttempt=0;
+bool otaReady=false, otaBusy=false;
+bool wifiWasConnected=false;
+void storeRf(const String &event) {
+  rfHistory[historyAt]=String(millis())+" "+event;
+  historyAt=(historyAt+1)%20;
+  if(historyCount<20) ++historyCount;
+}
+bool regRead(uint8_t addr,uint8_t &out,bool status=false);
+bool validBenchPing(const String &s);
+void tcpReply(String cmd) {
+  cmd.trim(); cmd.toLowerCase();
+  if(cmd=="status") {
+    benchClient.printf("state=%s angle=%.1f closed=%d sensor_fault=%d operation_fault=%s\n",
+      state.c_str(),calibrated()?constrain(position,0.0f,100.0f)*TRAVEL_DEG/100.0f:0.0f,
+      closedSwitch.stable,sensorFault,operationFault.c_str());
+  } else if(cmd=="rf") {
+    benchClient.printf("rx=%lu ack=%lu duplicates=%lu rejected=%lu unique=%lu crc=%lu empty=%lu oversize=%lu rx_error=%lu recoveries=%lu ack_error=%lu rearm_error=%lu begin_code=%d arm_code=%d link_ok=%d rssi=%.1f irq=%lu\n",
+      (unsigned long)rfRx,(unsigned long)rfAck,(unsigned long)rfDuplicates,
+      (unsigned long)rfRejected,(unsigned long)rfUnique,(unsigned long)rfCrcErrors,
+      (unsigned long)rfEmpty,(unsigned long)rfOversize,(unsigned long)rfRxErrors,
+      (unsigned long)rfRecoveries,(unsigned long)rfAckErrors,(unsigned long)rfRearmErrors,
+      lastRadioBeginCode,lastRadioArmCode,linkOK,lastRfRssi,(unsigned long)gateRxIrqs);
+  } else if(cmd=="ip") {
+    benchClient.printf("ip_rx=%lu ip_ack=%lu ip_reject=%lu port=2324 actuation=DISABLED\n",(unsigned long)ipBenchRx,(unsigned long)ipBenchAck,(unsigned long)ipBenchReject);
+  } else if(cmd=="diag") {
+    uint8_t marc=0,rxbytes=0,iocfg0=0,pktctrl0=0;
+    bool ok=regRead(0x35,marc,true) && regRead(0x3B,rxbytes,true)
+         && regRead(0x02,iocfg0) && regRead(0x08,pktctrl0);
+    benchClient.printf("spi=%d marc=0x%02X rxbytes=0x%02X fifo_count=%u overflow=%d gdo0=%d iocfg0=0x%02X pktctrl0=0x%02X irq=%lu spurious=%lu overflow_count=%lu discarded=%lu\n",
+      ok,marc,rxbytes,rxbytes&0x7F,(rxbytes&0x80)!=0,digitalRead(RF_GDO0_PIN),
+      iocfg0,pktctrl0,(unsigned long)gateRxIrqs,(unsigned long)rfSpurious,
+      (unsigned long)rfOverflow,(unsigned long)rfDiscard);
+  } else if(cmd=="logs") {
+    for(unsigned i=0;i<historyCount;i++) benchClient.println(rfHistory[(historyAt+20-historyCount+i)%20]);
+  } else if(cmd=="quit") benchClient.stop();
+  else benchClient.println("READ ONLY: status, rf, diag, logs, help, quit");
+}
+void beginGateOTA() {
+#if GATE_WIFI_ENABLED && defined(GATE_OTA_PASSWORD)
+  ArduinoOTA.setHostname("rf-gate-bench");
+  ArduinoOTA.setPassword(GATE_OTA_PASSWORD);
+  ArduinoOTA.onStart([]() {
+    otaBusy=true;
+    benchClient.stop();
+    commandBenchClient.stop();
+    Serial.println("OTA_BEGIN: gate actuation remains disabled");
+  });
+  ArduinoOTA.onEnd([]() { Serial.println("OTA_COMPLETE"); });
+  ArduinoOTA.onError([](ota_error_t error) {
+    otaBusy=false;
+    Serial.printf("OTA_ERROR code=%u\n",(unsigned)error);
+  });
+  ArduinoOTA.begin();
+  otaReady=true;
+  Serial.println("GATE_OTA READY hostname=rf-gate-bench port=3232");
+#else
+  Serial.println("GATE_OTA DISABLED: set GATE_OTA_PASSWORD locally");
+#endif
+}
+void tickTcp() {
+#if GATE_WIFI_ENABLED
+  if(WiFi.status()!=WL_CONNECTED) {
+    wifiWasConnected=false;
+    if(millis()-wifiLastAttempt>=10000) { wifiLastAttempt=millis(); WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD); }
+    return;
+  }
+  if(!wifiWasConnected) {
+    wifiWasConnected=true;
+    Serial.printf("GATE_TCP_CONNECTED ip=%s port=2323\n",WiFi.localIP().toString().c_str());
+    if(!otaReady) beginGateOTA();
+  }
+  if(otaReady) ArduinoOTA.handle();
+  if(otaBusy) return;
+  // Separate BENCH-ONLY transport. Never reaches the actuator or service-button code.
+  if(!commandBenchClient || !commandBenchClient.connected()) {
+    commandBenchClient.stop();
+    commandBenchLine="";
+    commandBenchClient=commandBenchServer.available();
+    commandBenchAt=millis();
+    if(commandBenchClient) commandBenchClient.setTimeout(50);
+  }
+  if(commandBenchClient && commandBenchClient.connected()) {
+    unsigned budget=64;
+    while(commandBenchClient.available() && budget--) {
+      char c=(char)commandBenchClient.read();
+      commandBenchAt=millis();
+      if(c=='\n' || c=='\r') {
+        if(commandBenchLine.length()) {
+          if(validBenchPing(commandBenchLine)) {
+            ++ipBenchRx;
+            // Bench ACK means the request was parsed; no gate command is executed.
+            commandBenchClient.print("BENCHACK:"+commandBenchLine.substring(10)+"\n");
+            ++ipBenchAck;
+          } else {
+            ++ipBenchReject;
+            commandBenchClient.print("ERR:BENCH_ONLY\n");
+          }
+          commandBenchLine="";
+          commandBenchClient.stop();
+          break;
+        }
+      } else if(c>=32 && c<=126 && commandBenchLine.length()<24) commandBenchLine+=c;
+      else { ++ipBenchReject; commandBenchClient.stop(); commandBenchLine=""; break; }
+    }
+    if(commandBenchClient.connected() && millis()-commandBenchAt>2000) {
+      commandBenchClient.stop(); commandBenchLine="";
+    }
+  }
+  if(!benchClient || !benchClient.connected()) {
+    benchClient.stop();
+    benchClient=benchServer.available();
+    if(benchClient) benchClient.println("RF Gate Bench (READ ONLY): status, rf, ip, diag, logs, quit");
+  }
+  unsigned n=64;
+  while(benchClient && benchClient.available() && n--) {
+    char c=(char)benchClient.read();
+    if(c=='\n'||c=='\r') { if(tcpCommand.length()) { tcpReply(tcpCommand); tcpCommand=""; } }
+    else if(c>=32 && c<=126 && tcpCommand.length()<40) tcpCommand+=c;
+  }
+#endif
+}
+void beginBenchWifi() {
+#if GATE_WIFI_ENABLED
+  WiFi.mode(WIFI_STA);
+  WiFi.setHostname("rf-gate-bench");
+  WiFi.begin(GATE_WIFI_SSID,GATE_WIFI_PASSWORD);
+  benchServer.begin();
+  commandBenchServer.begin();
+  Serial.println("GATE_TCP Wi-Fi enabled; diagnostics 2323 and BENCHPING-only 2324");
+#else
+  Serial.println("GATE_TCP disabled; add local src/wifi_secrets.h");
+#endif
+}
+
 void message(const String &s) { notice=s; noticeAt=millis(); Serial.println(s); }
 void activateBench() {
   ++activationCount;
@@ -103,7 +301,7 @@ bool readyRadio() {
   while(digitalRead(MISO_PIN)==HIGH) if(micros()-t>20000) return false;
   return true;
 }
-bool regRead(uint8_t addr,uint8_t &out,bool status=false) {
+bool regRead(uint8_t addr,uint8_t &out,bool status) {
   SPI.beginTransaction(SPISettings(1000000,MSBFIRST,SPI_MODE0));
   digitalWrite(CS,LOW);
   bool ok=readyRadio();
@@ -133,6 +331,167 @@ void probeRadio() {
   }
   radioOK=ok && radioPart==0 && radioVersion!=0 && radioVersion!=255;
   Serial.printf("CC1101 SPI %s PART=0x%02X VERSION=0x%02X (RF idle)\n",radioOK?"PASS":"FAIL",radioPart,radioVersion);
+}
+
+void printRfDiagnostics(const char *site) {
+  uint8_t marc=0, txBytes=0, rxBytes=0;
+  bool ok=regRead(0x35,marc,true) && regRead(0x3A,txBytes,true) && regRead(0x3B,rxBytes,true);
+  Serial.printf("RF_DIAG site=%s spi=%d GDO0=%d GDO2=%d MARCSTATE=0x%02X TXBYTES=0x%02X RXBYTES=0x%02X\n",
+    site,ok,digitalRead(RF_GDO0_PIN),digitalRead(RF_GDO2_PIN),marc,txBytes,rxBytes);
+}
+bool validBenchPing(const String &s) {
+  if(!s.startsWith("BENCHPING:") || s.length()<11 || s.length()>20) return false;
+  for(unsigned i=10;i<s.length();++i) if(s[i]<'0'||s[i]>'9') return false;
+  return true;
+}
+void printRfConfig() {
+  const uint8_t addrs[]={0x00,0x02,0x06,0x07,0x08,0x0B,0x0C,0x0D,0x0E,0x0F,0x10,0x11,0x12,0x13,0x15,0x18,0x19,0x1B,0x21,0x22};
+  const char* names[]={"IOCFG2","IOCFG0","PKTLEN","PKTCTRL1","PKTCTRL0","FSCTRL1","FSCTRL0","FREQ2","FREQ1","FREQ0","MDMCFG4","MDMCFG3","MDMCFG2","MDMCFG1","DEVIATN","MCSM0","FOCCFG","AGCCTRL2","FREND1","FREND0"};
+  Serial.println("RF_CONFIG_BEGIN");
+  for(unsigned i=0;i<sizeof(addrs);++i) {
+    uint8_t v=0;
+    bool ok=regRead(addrs[i],v);
+    Serial.printf("RF_REG %s=0x%02X ok=%d\n",names[i],v,ok);
+  }
+  Serial.println("RF_CONFIG_END");
+}
+void startBenchLink() {
+  // SPI-only probe remains independent. No actuation commands are ever processed.
+  int rc=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(rc==RADIOLIB_ERR_NONE) rc=packetRadio.setBitRate(RF_BIT_RATE_KBPS);
+  if(rc==RADIOLIB_ERR_NONE) {
+    packetRadio.setPacketReceivedAction(onRadioPacket);
+    rc=packetRadio.startReceive();
+  }
+  linkOK=(rc==RADIOLIB_ERR_NONE);
+  lastRadioBeginCode=rc;
+  lastRadioArmCode=rc;
+  lastRadioRecoveryAt=millis();
+  beginGdo2Monitor();
+  Serial.printf("RF_BENCH %s code=%d frequency=%.2fMHz\n",linkOK?"READY":"FAIL",rc,RF_FREQUENCY_MHZ);
+}
+void benchRxStatus(const char* context) {
+  uint8_t marc=0, rxBytes=0, iocfg0=0;
+  bool ok=regRead(0x35,marc,true) && regRead(0x3B,rxBytes,true) && regRead(0x02,iocfg0);
+  Serial.printf("RF_RX_STATUS where=%s spi=%d irq_count=%lu pending=%d GDO0=%d MARCSTATE=0x%02X RXBYTES=0x%02X IOCFG0=0x%02X\n",
+    context,ok,(unsigned long)gateRxIrqs,radioPacketPending,
+    digitalRead(RF_GDO0_PIN),marc,rxBytes,iocfg0);
+}
+void recoverBenchReceiver(const char *reason) {
+  ++rfRecoveries;
+  lastRadioRecoveryAt=millis();
+  radioPacketPending=false;
+  // A plain startReceive() is insufficient after failed initialization.
+  // Reinitialize the CC1101 using the same configuration as startup.
+  packetRadio.clearPacketReceivedAction();
+  lastRadioBeginCode=packetRadio.begin(RF_FREQUENCY_MHZ);
+  if(lastRadioBeginCode==RADIOLIB_ERR_NONE)
+    lastRadioBeginCode=packetRadio.setBitRate(RF_BIT_RATE_KBPS);
+  if(lastRadioBeginCode==RADIOLIB_ERR_NONE) {
+    packetRadio.setPacketReceivedAction(onRadioPacket);
+    lastRadioArmCode=packetRadio.startReceive();
+  } else lastRadioArmCode=lastRadioBeginCode;
+  linkOK=(lastRadioArmCode==RADIOLIB_ERR_NONE);
+  if(!linkOK) ++rfRearmErrors;
+  Serial.printf("RF_RECOVERY reason=%s begin=%d arm=%d ok=%d\n",
+    reason,lastRadioBeginCode,lastRadioArmCode,linkOK);
+  storeRf(String("RECOVERY ")+reason+" begin="+String(lastRadioBeginCode)+
+          " arm="+String(lastRadioArmCode));
+}
+void rearmAfterBadFrame(const char *reason) {
+  // Do not reinitialize the entire radio in a tight IRQ-driven loop.
+  // CC1101 finishReceive() flushes the FIFO and restores GDO0 to high-Z.
+  radioPacketPending=false;
+  packetRadio.clearPacketReceivedAction();
+  int cleanup=packetRadio.standby();
+  packetRadio.setPacketReceivedAction(onRadioPacket);
+  int arm=packetRadio.startReceive();
+  lastRadioArmCode=arm;
+  linkOK=(arm==RADIOLIB_ERR_NONE);
+  ++rfDiscard;
+  if(!linkOK) ++rfRearmErrors;
+  lastBadFrameAt=millis();
+  storeRf(String("DISCARD ")+reason+" cleanup="+String(cleanup)+" arm="+String(arm));
+}
+void tickBenchLink() {
+  if(!linkOK) {
+    if(millis()-lastRadioRecoveryAt>=10000) {
+      recoverBenchReceiver("periodic_rearm");
+    }
+    return;
+  }
+  if(!radioPacketPending) return;
+  radioPacketPending=false;
+  // GDO0 can signal FIFO threshold or a spurious edge. Check FIFO state
+  // before consuming its first byte as a variable-length header.
+  uint8_t rxbytes=0,marc=0;
+  bool fifoOK=regRead(0x3B,rxbytes,true) && regRead(0x35,marc,true);
+  if(!fifoOK) { ++rfRxErrors; rearmAfterBadFrame("spi_status_error"); return; }
+  if(rxbytes&0x80) { ++rfOverflow; rearmAfterBadFrame("fifo_overflow"); return; }
+  if((rxbytes&0x7F)<4) {
+    ++rfSpurious;
+    // Empty FIFO: ignore edge and keep receiver armed. Avoid an
+    // immediate radio reset, especially if GPIO26 wiring is noisy.
+    return;
+  }
+  // CC1101 getPacketLength() consumes the length byte; call it exactly
+  // once before readData() and reject all oversized frames.
+  size_t len=packetRadio.getPacketLength();
+  if(len==0 || len>BENCH_MAX_PACKET) {
+    ++rfRejected;
+    if(!len) ++rfEmpty; else ++rfOversize;
+    Serial.printf("RF_RX_BAD_LENGTH len=%u\n",(unsigned)len);
+    storeRf(String("BAD_LENGTH ")+String((unsigned)len));
+    rearmAfterBadFrame("bad_length");
+    return;
+  }
+  uint8_t bytes[BENCH_MAX_PACKET+1]={0};
+  int rc=packetRadio.readData(bytes,len);
+  if(rc!=RADIOLIB_ERR_NONE) {
+    ++rfRxErrors;
+    if(rc==RADIOLIB_ERR_CRC_MISMATCH) ++rfCrcErrors;
+    Serial.printf("RF_RX_ERROR code=%d len=%u\n",rc,(unsigned)len);
+    storeRf(String("RX_ERROR ")+String(rc)+" len="+String((unsigned)len));
+    rearmAfterBadFrame("read_error");
+    return;
+  }
+  ++rfRx;
+  lastRfRssi=packetRadio.getRSSI();
+  String hex;
+  for(size_t i=0;i<len;i++) {
+    if(i) hex+=' ';
+    if(bytes[i]<16) hex+='0';
+    hex+=String(bytes[i],HEX);
+  }
+  String packet;
+  for(size_t i=0;i<len;i++) packet+=(char)bytes[i];
+  bool valid=validBenchPing(packet);
+  Serial.printf("RF_RX len=%u hex=%s valid=%d rssi=%.1f\n",
+    (unsigned)len,hex.c_str(),valid,lastRfRssi);
+  storeRf(String("RX len=")+String((unsigned)len)+" hex="+hex+" valid="+String(valid));
+  if(!valid) {
+    ++rfRejected;
+    storeRf("REJECT malformed");
+    rearmAfterBadFrame("invalid_payload");
+    return;
+  }
+  uint32_t requestID=strtoul(packet.c_str()+10,nullptr,10);
+  if(seenBenchID(requestID)) ++rfDuplicates; else ++rfUnique;
+  String reply="BENCHACK:"+packet.substring(10);
+  radioPacketPending=false;
+  delay(120); // Preserve the current ACK timing for controlled comparison.
+  int tx=packetRadio.transmit(reply);
+  radioPacketPending=false;
+  if(tx==RADIOLIB_ERR_NONE) ++rfAck; else ++rfAckErrors;
+  storeRf(String("ACK ")+reply+" code="+String(tx));
+  Serial.printf("RF_ACK status=%d count=%lu\n",tx,(unsigned long)rfAck);
+  if(tx!=RADIOLIB_ERR_NONE) printRfDiagnostics("gate_ack_tx_error");
+  int arm=packetRadio.startReceive();
+  lastRadioArmCode=arm;
+  if(arm!=RADIOLIB_ERR_NONE) {
+    ++rfRearmErrors;
+    recoverBenchReceiver("ack_rearm");
+  }
 }
 
 void resetMotion() {
@@ -332,6 +691,9 @@ void printStatus() {
     state.c_str(),radioOK?"SPI_OK":"FAIL",(unsigned long)activationCount,settled,mismatchPending,sensorFault,operationFault.c_str(),faultActive(),faultAcknowledged);
 }
 void command(char c) {
+  if(c=='d') { benchRxStatus("manual"); return; }
+  if(c=='D') { printRfConfig(); return; }
+  if(c=='R') { radioPacketPending=false; packetRadio.standby(); int rc=packetRadio.startReceive(); Serial.printf("RF_RX_RESET code=%d\n",rc); benchRxStatus("reset"); return; }
   if(c=='A') {
     if(!faultActive()) { message("No fault to acknowledge"); return; }
     faultAcknowledged=true;
@@ -359,7 +721,7 @@ void command(char c) {
   } else if(c=='x') { prefs.clear(); closedRaw=openRaw=-1; resetMotion(); message("Calibration cleared"); }
   else if(c=='r') probeRadio();
   else if(c=='s') printStatus();
-  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; O=expect open; C=expect close; K=cancel; A=ack; F=clear fault; h=help");
+  else if(c=='h' || c=='?') Serial.println("c=save closed; o=save open; x=clear calibration; r=probe radio; s=status; O=expect open; C=expect close; K=cancel; A=ack; F=clear fault; d=RF status; R=reset RX; h=help");
 }
 void draw(uint32_t now) {
   if(!displayOK || now-lastDraw<150) return;
@@ -414,10 +776,12 @@ void setup() {
   prefs.begin("gate-angle",false); closedRaw=prefs.getInt("closed",-1); openRaw=prefs.getInt("open",-1);
   Serial.println("\nMM571 GateNode Bench v1 - NO RELAY OUTPUT / NO RF COMMANDS");
   Serial.printf("OLED %s address=0x%02X\n",displayOK?"OK":"NOT FOUND",oledAddr);
-  probeRadio(); command('h');
+  probeRadio(); startBenchLink(); beginBenchWifi(); command('h');
 }
 void loop() {
-  uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now);
+  tickTcp();
+  if(otaBusy) { delay(1); return; }
+  uint32_t now=millis(); tickSensors(now); tickButton(now); tickExpectation(now); tickBenchLink();
   while(Serial.available()) command(Serial.read());
   if(now-lastReport>=2000) { lastReport=now; printStatus(); }
   draw(now); delay(1);
