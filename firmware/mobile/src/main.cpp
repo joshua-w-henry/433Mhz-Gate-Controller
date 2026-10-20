@@ -9,6 +9,14 @@
 #include "button.h"
 #include "radio_probe.h"
 #include <RadioLib.h>
+#include <WiFi.h>
+#include <WiFiClient.h>
+#if __has_include("wifi_secrets.h")
+#include "wifi_secrets.h"
+#define MOBILE_WIFI_ENABLED 1
+#else
+#define MOBILE_WIFI_ENABLED 0
+#endif
 #include "../../shared/radio_pins.h"
 
 // Mobile bench commissioning only. No RF packets or physical gate activation.
@@ -63,6 +71,9 @@ uint32_t testTransactions=0, testSucceeded=0, testFailed=0, testRetries=0;
 uint32_t firstAttemptOK=0, retryOK=0, txErrors=0, rxArmErrors=0, crcErrors=0, invalidAcks=0, ackWaitTimeouts=0;
 uint32_t latencyTotal=0, latencyMax=0;
 uint16_t batchRemaining=0;
+bool ipBatch=false;
+uint32_t wifiAttemptAt=0;
+uint32_t ipRequests=0,ipSuccess=0,ipFailed=0,ipLatencyTotal=0,ipLatencyMax=0;
 uint32_t batchNextAt=0;
 void printTestStats() {
   Serial.printf("RF_STATS requests=%lu success=%lu failed=%lu retries=%lu first_ok=%lu retry_ok=%lu tx_error=%lu rx_arm_error=%lu crc=%lu invalid_ack=%lu ack_timeout=%lu avg_ack_ms=%lu max_ack_ms=%lu remaining=%u\n",
@@ -71,6 +82,50 @@ void printTestStats() {
     (unsigned long)txErrors,(unsigned long)rxArmErrors,(unsigned long)crcErrors,
     (unsigned long)invalidAcks,(unsigned long)ackWaitTimeouts,
     (unsigned long)(testSucceeded?latencyTotal/testSucceeded:0),(unsigned long)latencyMax,batchRemaining);
+}
+void tickMobileWifi() {
+#if MOBILE_WIFI_ENABLED
+  if(WiFi.status()!=WL_CONNECTED && millis()-wifiAttemptAt>=10000) {
+    wifiAttemptAt=millis();
+    WiFi.begin(MOBILE_WIFI_SSID,MOBILE_WIFI_PASSWORD);
+  }
+#endif
+}
+void printIpStats() {
+  Serial.printf("IP_STATS requests=%lu success=%lu failed=%lu avg_ack_ms=%lu max_ack_ms=%lu wifi=%d ip=%s\n",
+    (unsigned long)ipRequests,(unsigned long)ipSuccess,(unsigned long)ipFailed,
+    (unsigned long)(ipSuccess?ipLatencyTotal/ipSuccess:0),(unsigned long)ipLatencyMax,
+    WiFi.status()==WL_CONNECTED,WiFi.localIP().toString().c_str());
+}
+void sendIpBenchPing() {
+  ++ipRequests;
+  uint32_t id=++benchPingSeq;
+  uint32_t started=millis();
+  bool success=false;
+#if MOBILE_WIFI_ENABLED
+  if(WiFi.status()==WL_CONNECTED) {
+    WiFiClient client;
+    client.setTimeout(900);
+    if(client.connect(IPAddress(192,168,86,58),2324,900)) {
+      client.print("BENCHPING:"+String(id)+"\n");
+      String reply=client.readStringUntil('\n');
+      reply.trim();
+      success=(reply=="BENCHACK:"+String(id));
+      if(!success) Serial.printf("IP_REPLY_BAD id=%lu reply=%s\n",(unsigned long)id,reply.c_str());
+    }
+    client.stop();
+  }
+#endif
+  uint32_t latency=millis()-started;
+  if(success) {
+    ++ipSuccess; ipLatencyTotal+=latency;
+    if(latency>ipLatencyMax) ipLatencyMax=latency;
+  } else ++ipFailed;
+  Serial.printf("IP_TRANSACTION id=%lu success=%d latency_ms=%lu\n",
+    (unsigned long)id,success,(unsigned long)latency);
+  printIpStats();
+  wakeScreen();
+  banner=success?"IP ACK OK":"IP NO ACK"; messageAt=millis();
 }
 void sendBenchPing() {
   if(!linkOK) { Serial.println("RF_BENCH link unavailable"); return; }
@@ -190,9 +245,13 @@ void setup() {
   Serial.println("p=send harmless RF BENCHPING; no actuation commands transmitted");
   Serial.println("a=ACTIVATE test; s=STATUS test/page; r=radio probe; h=help");
   Serial.println("Requests are logged locally only. No RF transmissions. Gate remains UNKNOWN.");
+  WiFi.mode(WIFI_STA);
+  tickMobileWifi();
+  Serial.println("i=IP BENCHPING; T=100 IP transactions; V=IP stats; t=100 RF transactions");
   lastInteraction=millis();
 }
 void loop() {
+  tickMobileWifi();
   uint32_t now=millis();
   bool a=activateButton.update(digitalRead(ACTIVATE_PIN)==LOW,now);
   bool s=statusButton.update(digitalRead(STATUS_PIN)==LOW,now);
@@ -201,9 +260,11 @@ void loop() {
   else if(a) requestBench("ACTIVATE");
   while(Serial.available()) {
     char c=Serial.read();
-    if(c=='t') { batchRemaining=100; batchNextAt=millis(); Serial.println("RF_BATCH begin count=100 (paced 2s between requests)"); }
+    if(c=='t' || c=='T') { ipBatch=(c=='T'); batchRemaining=100; batchNextAt=millis(); Serial.println(ipBatch?"IP_BATCH begin count=100":"RF_BATCH begin count=100"); }
     else if(c=='z') { batchRemaining=0; Serial.println("RF_BATCH cancelled"); }
     else if(c=='v') printTestStats();
+    else if(c=='V') printIpStats();
+    else if(c=='i') sendIpBenchPing();
     else if(c=='d') printRfConfig();
     else if(c=='p') sendBenchPing();
     else if(c=='a') requestBench("ACTIVATE");
@@ -214,9 +275,9 @@ void loop() {
   now=millis();
   if(batchRemaining && (int32_t)(now-batchNextAt)>=0) {
     --batchRemaining;
-    sendBenchPing();
+    if(ipBatch) sendIpBenchPing(); else sendBenchPing();
     batchNextAt=millis()+2000;
-    if(!batchRemaining) Serial.println("RF_BATCH completed");
+    if(!batchRemaining) Serial.println(ipBatch?"IP_BATCH completed":"RF_BATCH completed");
   }
   if(screenOn && now-lastInteraction>=SCREEN_IDLE_MS) {
     if(displayOK) oled.ssd1306_command(SSD1306_DISPLAYOFF);
