@@ -8,3 +8,5 @@ secrets.ini
 .env
 .env.*
 !.env.example
+
+wifi_secrets.h
